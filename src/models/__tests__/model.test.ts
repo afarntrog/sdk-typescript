@@ -303,6 +303,7 @@ describe('Model', () => {
         expect(items).toContainEqual({
           type: 'reasoningBlock',
           text: 'Thinking about the problem',
+          contentKey: 'reasoningContent',
           signature: 'sig1',
         })
         expect(items).toContainEqual({
@@ -319,6 +320,7 @@ describe('Model', () => {
                 type: 'reasoningBlock',
                 text: 'Thinking about the problem',
                 signature: 'sig1',
+                contentKey: 'reasoningContent',
               },
             ],
           },
@@ -353,6 +355,7 @@ describe('Model', () => {
         expect(items).toContainEqual({
           type: 'reasoningBlock',
           redactedContent: new Uint8Array(0),
+          contentKey: 'reasoningContent',
         })
         expect(items).toContainEqual({
           type: 'modelMetadataEvent',
@@ -367,6 +370,7 @@ describe('Model', () => {
               {
                 type: 'reasoningBlock',
                 redactedContent: new Uint8Array(0),
+                contentKey: 'reasoningContent',
               },
             ],
           },
@@ -401,6 +405,7 @@ describe('Model', () => {
         expect(items).toContainEqual({
           type: 'reasoningBlock',
           text: 'Thinking',
+          contentKey: 'reasoningContent',
         })
         expect(items).toContainEqual({
           type: 'modelMetadataEvent',
@@ -415,6 +420,7 @@ describe('Model', () => {
               {
                 type: 'reasoningBlock',
                 text: 'Thinking',
+                contentKey: 'reasoningContent',
               },
             ],
           },
@@ -470,7 +476,12 @@ describe('Model', () => {
           name: 'get_weather',
           input: { city: 'Paris' },
         })
-        expect(items).toContainEqual({ type: 'reasoningBlock', text: 'Reasoning', signature: 'sig1' })
+        expect(items).toContainEqual({
+          type: 'reasoningBlock',
+          text: 'Reasoning',
+          signature: 'sig1',
+          contentKey: 'reasoningContent',
+        })
         expect(items).toContainEqual({
           type: 'modelMetadataEvent',
           usage: { inputTokens: 10, outputTokens: 15, totalTokens: 25 },
@@ -483,7 +494,7 @@ describe('Model', () => {
             content: [
               { type: 'textBlock', text: 'Hello' },
               { type: 'toolUseBlock', toolUseId: 'tool1', name: 'get_weather', input: { city: 'Paris' } },
-              { type: 'reasoningBlock', text: 'Reasoning', signature: 'sig1' },
+              { type: 'reasoningBlock', text: 'Reasoning', signature: 'sig1', contentKey: 'reasoningContent' },
             ],
           },
           stopReason: 'endTurn',

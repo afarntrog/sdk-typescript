@@ -282,6 +282,12 @@ export interface ReasoningBlockData {
    * The redacted content of the reasoning process.
    */
   redactedContent?: Uint8Array
+
+  /**
+   * The provider content key that produced this reasoning block.
+   * Defaults to `reasoningContent` but may be `thinking` for providers that emit thinking blocks.
+   */
+  contentKey?: 'reasoningContent' | 'thinking'
 }
 
 /**
@@ -308,6 +314,11 @@ export class ReasoningBlock implements ReasoningBlockData {
    */
   readonly redactedContent?: Uint8Array
 
+  /**
+   * The provider content key that produced this reasoning block.
+   */
+  readonly contentKey?: 'reasoningContent' | 'thinking'
+
   constructor(data: ReasoningBlockData) {
     if (data.text !== undefined) {
       this.text = data.text
@@ -318,6 +329,7 @@ export class ReasoningBlock implements ReasoningBlockData {
     if (data.redactedContent !== undefined) {
       this.redactedContent = data.redactedContent
     }
+    this.contentKey = data.contentKey ?? 'reasoningContent'
   }
 }
 

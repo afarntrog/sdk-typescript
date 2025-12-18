@@ -79,6 +79,7 @@ describe('ReasoningBlock', () => {
     expect(block).toEqual({
       type: 'reasoningBlock',
       text: 'thinking...',
+      contentKey: 'reasoningContent',
     })
   })
 })

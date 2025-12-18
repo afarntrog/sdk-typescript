@@ -191,6 +191,7 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
       text?: string
       signature?: string
       redactedContent?: Uint8Array
+      contentKey?: 'reasoningContent' | 'thinking'
     } = {}
     let errorToThrow: Error | undefined = undefined
     let stoppedMessage: Message | null = null
@@ -230,6 +231,8 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
               if (event.delta.text) accumulatedReasoning.text = (accumulatedReasoning.text ?? '') + event.delta.text
               if (event.delta.signature) accumulatedReasoning.signature = event.delta.signature
               if (event.delta.redactedContent) accumulatedReasoning.redactedContent = event.delta.redactedContent
+              if (event.delta.contentKey) accumulatedReasoning.contentKey = event.delta.contentKey
+              if (!accumulatedReasoning.contentKey) accumulatedReasoning.contentKey = 'reasoningContent'
               break
           }
           break
@@ -249,6 +252,7 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
             } else if (Object.keys(accumulatedReasoning).length > 0) {
               block = new ReasoningBlock({
                 ...accumulatedReasoning,
+                contentKey: accumulatedReasoning.contentKey ?? 'reasoningContent',
               })
             } else {
               block = new TextBlock(accumulatedText)

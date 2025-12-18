@@ -356,6 +356,11 @@ export interface ReasoningContentDelta {
    * Incremental redacted content data.
    */
   redactedContent?: Uint8Array
+
+  /**
+   * Provider-specific content key for reasoning/thinking blocks.
+   */
+  contentKey?: 'reasoningContent' | 'thinking'
 }
 
 /**

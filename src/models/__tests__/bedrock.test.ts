@@ -3,8 +3,7 @@ import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime'
 import { isNode } from '../../__fixtures__/environment.js'
 import { BedrockModel } from '../bedrock.js'
 import { ContextWindowOverflowError } from '../../errors.js'
-import type { Message } from '../../types/messages.js'
-import { TextBlock, GuardContentBlock, CachePointBlock } from '../../types/messages.js'
+import { Message, TextBlock, GuardContentBlock, CachePointBlock, ReasoningBlock } from '../../types/messages.js'
 import type { StreamOptions } from '../model.js'
 import { collectIterator } from '../../__fixtures__/model-test-helpers.js'
 
@@ -661,7 +660,7 @@ describe('BedrockModel', () => {
       expect(events).toContainEqual({ type: 'modelContentBlockStartEvent' })
       expect(events).toContainEqual({
         type: 'modelContentBlockDeltaEvent',
-        delta: { type: 'reasoningContentDelta', text: 'Thinking...' },
+        delta: { type: 'reasoningContentDelta', text: 'Thinking...', contentKey: 'reasoningContent' },
       })
       expect(events).toContainEqual({ type: 'modelContentBlockStopEvent' })
       expect(events).toContainEqual({ stopReason: 'endTurn', type: 'modelMessageStopEvent' })
@@ -719,7 +718,7 @@ describe('BedrockModel', () => {
       expect(events).toContainEqual({ type: 'modelContentBlockStartEvent' })
       expect(events).toContainEqual({
         type: 'modelContentBlockDeltaEvent',
-        delta: { type: 'reasoningContentDelta', redactedContent: redactedBytes },
+        delta: { type: 'reasoningContentDelta', redactedContent: redactedBytes, contentKey: 'reasoningContent' },
       })
       expect(events).toContainEqual({ type: 'modelContentBlockStopEvent' })
       expect(events).toContainEqual({ stopReason: 'endTurn', type: 'modelMessageStopEvent' })
@@ -813,6 +812,7 @@ describe('BedrockModel', () => {
           type: 'reasoningContentDelta',
           text: 'thinking...',
           signature: 'sig123',
+          contentKey: 'reasoningContent',
         },
       })
       expect(events).toContainEqual({
@@ -820,6 +820,7 @@ describe('BedrockModel', () => {
         delta: {
           type: 'reasoningContentDelta',
           redactedContent: new Uint8Array(1),
+          contentKey: 'reasoningContent',
         },
       })
     })
@@ -892,6 +893,57 @@ describe('BedrockModel', () => {
         expect(reasoningDelta.delta.text).toBeUndefined()
         expect(reasoningDelta.delta.signature).toBe('sig123')
       }
+    })
+
+    it('handles thinking content delta events and preserves content key', async () => {
+      setupMockSend(async function* () {
+        yield { messageStart: { role: 'assistant' } }
+        yield { contentBlockStart: {} }
+        yield {
+          contentBlockDelta: {
+            delta: { thinking: { text: 'pondering...', signature: 'sig-think' } },
+          },
+        }
+        yield { contentBlockStop: {} }
+        yield { messageStop: { stopReason: 'end_turn' } }
+        yield { metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } }
+      })
+
+      const provider = new BedrockModel()
+      const messages: Message[] = [{ type: 'message', role: 'user', content: [{ type: 'textBlock', text: 'Hello' }] }]
+
+      const stream = provider.streamAggregated(messages)
+      let result = await stream.next()
+      let reasoningBlock: ReasoningBlock | undefined
+
+      while (!result.done) {
+        if (result.value instanceof ReasoningBlock) {
+          reasoningBlock = result.value
+        }
+        result = await stream.next()
+      }
+
+      const finalResult = result.value
+      expect(reasoningBlock?.text).toBe('pondering...')
+      expect(reasoningBlock?.signature).toBe('sig-think')
+      expect(reasoningBlock?.contentKey).toBe('thinking')
+      expect(finalResult.message.content.some((block) => block.type === 'reasoningBlock')).toBe(true)
+    })
+
+    it('formats thinking blocks using thinking content key', () => {
+      const provider = new BedrockModel()
+      const messages = [
+        new Message({
+          role: 'assistant',
+          content: [new ReasoningBlock({ text: 'thoughts', signature: 'sig', contentKey: 'thinking' })],
+        }),
+      ]
+
+      const formatted = (provider as unknown as { _formatMessages: (msgs: Message[]) => unknown[] })._formatMessages(
+        messages
+      ) as Array<{ content: Array<Record<string, unknown>> }>
+
+      expect(formatted[0]?.content[0]).toEqual({ thinking: { text: 'thoughts', signature: 'sig' } })
     })
 
     it('handles cache usage metrics', async () => {
