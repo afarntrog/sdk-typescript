@@ -581,6 +581,14 @@ export class BedrockModel extends Model<BedrockModelConfig> {
             }
             // Bedrock SDK types do not yet model thinking blocks; cast for compatibility.
             return thinkingContent as unknown as BedrockContentBlock
+          } else if (contentKey === 'redacted_thinking') {
+            const redactedThinkingContent = {
+              redacted_thinking: {
+                text: block.text,
+                signature: block.signature,
+              },
+            }
+            return redactedThinkingContent as unknown as BedrockContentBlock
           }
 
           return {
@@ -600,6 +608,13 @@ export class BedrockModel extends Model<BedrockModelConfig> {
             }
             // Bedrock SDK types do not yet model thinking blocks; cast for compatibility.
             return thinkingContent as unknown as BedrockContentBlock
+          } else if (contentKey === 'redacted_thinking') {
+            const redactedThinkingContent = {
+              redacted_thinking: {
+                redactedContent: block.redactedContent,
+              },
+            }
+            return redactedThinkingContent as unknown as BedrockContentBlock
           }
 
           return {
@@ -832,7 +847,7 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       redacted_thinking: (block: { redactedContent?: Uint8Array }): void => {
         const delta: ReasoningContentDelta = {
           type: 'reasoningContentDelta',
-          contentKey: 'thinking',
+          contentKey: 'redacted_thinking',
         }
         if (block?.redactedContent) {
           delta.redactedContent = block.redactedContent
@@ -955,7 +970,11 @@ export class BedrockModel extends Model<BedrockModelConfig> {
             if (reasoning.signature) reasoningDelta.signature = reasoning.signature
             if (reasoning.redactedContent) reasoningDelta.redactedContent = reasoning.redactedContent
 
-            if (Object.keys(reasoningDelta).length > 1) {
+            if (
+              reasoningDelta.text !== undefined ||
+              reasoningDelta.signature !== undefined ||
+              reasoningDelta.redactedContent !== undefined
+            ) {
               events.push({ type: 'modelContentBlockDeltaEvent', delta: reasoningDelta })
             }
           },
@@ -971,18 +990,28 @@ export class BedrockModel extends Model<BedrockModelConfig> {
               if (maybeThinking.redactedContent) reasoningDelta.redactedContent = maybeThinking.redactedContent
             }
 
-            if (Object.keys(reasoningDelta).length > 1) {
+            if (
+              reasoningDelta.text !== undefined ||
+              reasoningDelta.signature !== undefined ||
+              reasoningDelta.redactedContent !== undefined
+            ) {
               events.push({ type: 'modelContentBlockDeltaEvent', delta: reasoningDelta })
             }
           },
           redacted_thinking: (thinking: { redactedContent?: Uint8Array }): void => {
-            if (!thinking?.redactedContent) return
+            if (!thinking) return
             const reasoningDelta: ReasoningContentDelta = {
               type: 'reasoningContentDelta',
-              contentKey: 'thinking',
-              redactedContent: thinking.redactedContent,
+              contentKey: 'redacted_thinking',
             }
-            events.push({ type: 'modelContentBlockDeltaEvent', delta: reasoningDelta })
+            if (thinking.redactedContent) reasoningDelta.redactedContent = thinking.redactedContent
+            if (
+              reasoningDelta.text !== undefined ||
+              reasoningDelta.signature !== undefined ||
+              reasoningDelta.redactedContent !== undefined
+            ) {
+              events.push({ type: 'modelContentBlockDeltaEvent', delta: reasoningDelta })
+            }
           },
         }
 

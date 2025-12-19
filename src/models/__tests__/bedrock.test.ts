@@ -930,6 +930,39 @@ describe('BedrockModel', () => {
       expect(finalResult.message.content.some((block) => block.type === 'reasoningBlock')).toBe(true)
     })
 
+    it('handles redacted thinking content delta events and preserves content key', async () => {
+      const redacted = new Uint8Array([9, 9])
+      setupMockSend(async function* () {
+        yield { messageStart: { role: 'assistant' } }
+        yield { contentBlockStart: {} }
+        yield {
+          contentBlockDelta: {
+            delta: { redacted_thinking: { redactedContent: redacted } },
+          },
+        }
+        yield { contentBlockStop: {} }
+        yield { messageStop: { stopReason: 'end_turn' } }
+        yield { metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } }
+      })
+
+      const provider = new BedrockModel()
+      const messages: Message[] = [{ type: 'message', role: 'user', content: [{ type: 'textBlock', text: 'Hello' }] }]
+
+      const stream = provider.streamAggregated(messages)
+      let result = await stream.next()
+      let reasoningBlock: ReasoningBlock | undefined
+
+      while (!result.done) {
+        if (result.value instanceof ReasoningBlock) {
+          reasoningBlock = result.value
+        }
+        result = await stream.next()
+      }
+
+      expect(reasoningBlock?.redactedContent).toEqual(redacted)
+      expect(reasoningBlock?.contentKey).toBe('redacted_thinking')
+    })
+
     it('formats thinking blocks using thinking content key', () => {
       const provider = new BedrockModel()
       const messages = [
@@ -944,6 +977,23 @@ describe('BedrockModel', () => {
       ) as Array<{ content: Array<Record<string, unknown>> }>
 
       expect(formatted[0]?.content[0]).toEqual({ thinking: { text: 'thoughts', signature: 'sig' } })
+    })
+
+    it('formats redacted thinking blocks using redacted_thinking content key', () => {
+      const provider = new BedrockModel()
+      const redacted = new Uint8Array([1, 2])
+      const messages = [
+        new Message({
+          role: 'assistant',
+          content: [new ReasoningBlock({ redactedContent: redacted, contentKey: 'redacted_thinking' })],
+        }),
+      ]
+
+      const formatted = (provider as unknown as { _formatMessages: (msgs: Message[]) => unknown[] })._formatMessages(
+        messages
+      ) as Array<{ content: Array<Record<string, unknown>> }>
+
+      expect(formatted[0]?.content[0]).toEqual({ redacted_thinking: { redactedContent: redacted } })
     })
 
     it('handles cache usage metrics', async () => {

@@ -287,7 +287,7 @@ export interface ReasoningBlockData {
    * The provider content key that produced this reasoning block.
    * Defaults to `reasoningContent` but may be `thinking` for providers that emit thinking blocks.
    */
-  contentKey?: 'reasoningContent' | 'thinking'
+  contentKey?: 'reasoningContent' | 'thinking' | 'redacted_thinking'
 }
 
 /**
@@ -317,7 +317,7 @@ export class ReasoningBlock implements ReasoningBlockData {
   /**
    * The provider content key that produced this reasoning block.
    */
-  readonly contentKey?: 'reasoningContent' | 'thinking'
+  readonly contentKey?: 'reasoningContent' | 'thinking' | 'redacted_thinking'
 
   constructor(data: ReasoningBlockData) {
     if (data.text !== undefined) {

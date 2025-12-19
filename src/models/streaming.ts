@@ -360,7 +360,7 @@ export interface ReasoningContentDelta {
   /**
    * Provider-specific content key for reasoning/thinking blocks.
    */
-  contentKey?: 'reasoningContent' | 'thinking'
+  contentKey?: 'reasoningContent' | 'thinking' | 'redacted_thinking'
 }
 
 /**

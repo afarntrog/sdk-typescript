@@ -191,7 +191,7 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
       text?: string
       signature?: string
       redactedContent?: Uint8Array
-      contentKey?: 'reasoningContent' | 'thinking'
+      contentKey?: 'reasoningContent' | 'thinking' | 'redacted_thinking'
     } = {}
     let errorToThrow: Error | undefined = undefined
     let stoppedMessage: Message | null = null
