@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Check Authorization
         id: auth
-        uses: strands-agents/devtools/authorization-check@main
+        uses: strands-agents/devtools/authorization-check@secret_id_optional
         with:
           skip-check: ${{ github.event_name == 'workflow_dispatch' }}
           username: ${{ github.event.comment.user.login || 'invalid' }}
@@ -50,7 +50,7 @@ jobs:
     steps:
       - name: Parse input
         id: parse
-        uses: strands-agents/devtools/strands-command/actions/strands-input-parser@main
+        uses: strands-agents/devtools/strands-command/actions/strands-input-parser@secret_id_optional
         with:
           issue_id: ${{ inputs.issue_id }}
           command: ${{ inputs.command }}
@@ -77,7 +77,7 @@ jobs:
 
       - name: Run Strands Agent
         id: agent-runner
-        uses: strands-agents/devtools/strands-command/actions/strands-agent-runner@main
+        uses: strands-agents/devtools/strands-command/actions/strands-agent-runner@secret_id_optional
         with:
           aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
           sessions_bucket: ${{ secrets.AGENT_SESSIONS_BUCKET }} # Optional. Ideally should be stored in aws secrets
@@ -95,4 +95,4 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Execute write operations
-        uses: strands-agents/devtools/strands-command/actions/strands-finalize@main
+        uses: strands-agents/devtools/strands-command/actions/strands-finalize@secret_id_optional
