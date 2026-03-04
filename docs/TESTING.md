@@ -48,8 +48,24 @@ tests_integ/
 
 ### Test File Naming
 
-- Unit tests: `{sourceFileName}.test.ts` in `src/**/__tests__/**`
-- Integration tests: `{feature}.test.ts` in `test/integ/`
+**File naming determines which environment(s) tests run in:**
+
+- `*.test.ts` — runs in **both** Node.js and browser environments
+- `*.test.node.ts` — runs **only** in Node.js environment
+- `*.test.browser.ts` — runs **only** in browser environment
+
+This naming convention applies to both unit tests (`src/**/__tests__/`) and integration tests (`test/integ/`).
+
+**Examples:**
+
+```
+src/module/__tests__/
+├── module.test.ts           # Runs in Node.js AND browser
+├── module.test.node.ts      # Runs in Node.js only
+└── module.test.browser.ts   # Runs in browser only
+```
+
+Use environment-specific test files when tests depend on platform-specific features like filesystem access, environment variables, or browser APIs.
 
 ## Test Structure Pattern
 
@@ -375,7 +391,7 @@ const events = await collectIterator(agent.stream('Hi'))
 ### Hook Fixtures (`mock-hook-provider.ts`)
 
 - **`MockHookProvider`** - Records all hook invocations for verification. Pass to `Agent({ hooks: [provider] })`.
-  - Use `{ includeModelEvents: false }` to exclude `ModelStreamEventHook` from recordings.
+  - Use `{ includeModelEvents: false }` to exclude model streaming and result events from recordings.
   - Access `provider.invocations` to verify hook events fired.
 
 ```typescript

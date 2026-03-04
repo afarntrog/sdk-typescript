@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  InitializedEvent,
   AfterInvocationEvent,
   AfterModelCallEvent,
   AfterToolCallEvent,
@@ -9,11 +10,38 @@ import {
   BeforeToolCallEvent,
   BeforeToolsEvent,
   MessageAddedEvent,
-  ModelStreamEventHook,
+  ModelStreamUpdateEvent,
+  ContentBlockEvent,
+  ModelMessageEvent,
+  ToolResultEvent,
+  ToolStreamUpdateEvent,
+  AgentResultEvent,
 } from '../events.js'
 import { Agent } from '../../agent/agent.js'
-import { Message, TextBlock, ToolResultBlock } from '../../types/messages.js'
+import { AgentResult } from '../../types/agent.js'
+import { Message, TextBlock, ToolResultBlock, ToolUseBlock } from '../../types/messages.js'
 import { FunctionTool } from '../../tools/function-tool.js'
+import { ToolStreamEvent } from '../../tools/tool.js'
+
+describe('InitializedEvent', () => {
+  it('creates instance with correct properties', () => {
+    const agent = new Agent()
+    const event = new InitializedEvent({ agent })
+
+    expect(event).toEqual({
+      type: 'initializedEvent',
+      agent: agent,
+    })
+    // @ts-expect-error verifying that property is readonly
+    event.agent = new Agent()
+  })
+
+  it('returns false for _shouldReverseCallbacks', () => {
+    const agent = new Agent()
+    const event = new InitializedEvent({ agent })
+    expect(event._shouldReverseCallbacks()).toBe(false)
+  })
+})
 
 describe('BeforeInvocationEvent', () => {
   it('creates instance with correct properties', () => {
@@ -58,7 +86,7 @@ describe('AfterInvocationEvent', () => {
 describe('MessageAddedEvent', () => {
   it('creates instance with correct properties', () => {
     const agent = new Agent()
-    const message = new Message({ role: 'assistant', content: [{ type: 'textBlock', text: 'Hello' }] })
+    const message = new Message({ role: 'assistant', content: [new TextBlock('Hello')] })
     const event = new MessageAddedEvent({ agent, message })
 
     expect(event).toEqual({
@@ -206,6 +234,42 @@ describe('AfterToolCallEvent', () => {
     const event = new AfterToolCallEvent({ agent, toolUse, tool: undefined, result })
     expect(event._shouldReverseCallbacks()).toBe(true)
   })
+
+  it('allows retry to be set when error is present', () => {
+    const agent = new Agent()
+    const toolUse = { name: 'test', toolUseId: 'id', input: {} }
+    const result = new ToolResultBlock({
+      toolUseId: 'id',
+      status: 'error',
+      content: [new TextBlock('Error')],
+    })
+    const error = new Error('Tool failed')
+    const event = new AfterToolCallEvent({ agent, toolUse, tool: undefined, result, error })
+
+    expect(event.retry).toBeUndefined()
+
+    event.retry = true
+    expect(event.retry).toBe(true)
+
+    event.retry = false
+    expect(event.retry).toBe(false)
+  })
+
+  it('allows retry to be set on success', () => {
+    const agent = new Agent()
+    const toolUse = { name: 'test', toolUseId: 'id', input: {} }
+    const result = new ToolResultBlock({
+      toolUseId: 'id',
+      status: 'success',
+      content: [new TextBlock('Success')],
+    })
+    const event = new AfterToolCallEvent({ agent, toolUse, tool: undefined, result })
+
+    expect(event.retry).toBeUndefined()
+
+    event.retry = true
+    expect(event.retry).toBe(true)
+  })
 })
 
 describe('BeforeModelCallEvent', () => {
@@ -231,7 +295,7 @@ describe('BeforeModelCallEvent', () => {
 describe('AfterModelCallEvent', () => {
   it('creates instance with correct properties on success', () => {
     const agent = new Agent()
-    const message = new Message({ role: 'assistant', content: [{ type: 'textBlock', text: 'Response' }] })
+    const message = new Message({ role: 'assistant', content: [new TextBlock('Response')] })
     const stopReason = 'endTurn'
     const response = { message, stopReason }
     const event = new AfterModelCallEvent({ agent, stopData: response })
@@ -271,43 +335,43 @@ describe('AfterModelCallEvent', () => {
     expect(event._shouldReverseCallbacks()).toBe(true)
   })
 
-  it('allows retryModelCall to be set when error is present', () => {
+  it('allows retry to be set when error is present', () => {
     const agent = new Agent()
     const error = new Error('Model failed')
     const event = new AfterModelCallEvent({ agent, error })
 
     // Initially undefined
-    expect(event.retryModelCall).toBeUndefined()
+    expect(event.retry).toBeUndefined()
 
     // Can be set to true
-    event.retryModelCall = true
-    expect(event.retryModelCall).toBe(true)
+    event.retry = true
+    expect(event.retry).toBe(true)
 
     // Can be set to false
-    event.retryModelCall = false
-    expect(event.retryModelCall).toBe(false)
+    event.retry = false
+    expect(event.retry).toBe(false)
   })
 
-  it('retryModelCall is optional and defaults to undefined', () => {
+  it('retry is optional and defaults to undefined', () => {
     const agent = new Agent()
     const error = new Error('Model failed')
     const event = new AfterModelCallEvent({ agent, error })
 
-    expect(event.retryModelCall).toBeUndefined()
+    expect(event.retry).toBeUndefined()
   })
 })
 
-describe('ModelStreamEventHook', () => {
+describe('ModelStreamUpdateEvent', () => {
   it('creates instance with correct properties', () => {
     const agent = new Agent()
     const streamEvent = {
       type: 'modelMessageStartEvent' as const,
       role: 'assistant' as const,
     }
-    const hookEvent = new ModelStreamEventHook({ agent, event: streamEvent })
+    const hookEvent = new ModelStreamUpdateEvent({ agent, event: streamEvent })
 
     expect(hookEvent).toEqual({
-      type: 'modelStreamEventHook',
+      type: 'modelStreamUpdateEvent',
       agent: agent,
       event: streamEvent,
     })
@@ -316,15 +380,105 @@ describe('ModelStreamEventHook', () => {
     // @ts-expect-error verifying that property is readonly
     hookEvent.event = streamEvent
   })
+})
 
-  it('returns false for _shouldReverseCallbacks', () => {
+describe('ContentBlockEvent', () => {
+  it('creates instance with correct properties', () => {
     const agent = new Agent()
-    const streamEvent = {
-      type: 'modelMessageStartEvent' as const,
-      role: 'assistant' as const,
-    }
-    const hookEvent = new ModelStreamEventHook({ agent, event: streamEvent })
-    expect(hookEvent._shouldReverseCallbacks()).toBe(false)
+    const contentBlock = new TextBlock('Hello')
+    const event = new ContentBlockEvent({ agent, contentBlock })
+
+    expect(event).toEqual({
+      type: 'contentBlockEvent',
+      agent: agent,
+      contentBlock: contentBlock,
+    })
+    // @ts-expect-error verifying that property is readonly
+    event.agent = new Agent()
+    // @ts-expect-error verifying that property is readonly
+    event.contentBlock = contentBlock
+  })
+})
+
+describe('ModelMessageEvent', () => {
+  it('creates instance with correct properties', () => {
+    const agent = new Agent()
+    const message = new Message({ role: 'assistant', content: [new TextBlock('Hello')] })
+    const event = new ModelMessageEvent({ agent, message, stopReason: 'endTurn' })
+
+    expect(event).toEqual({
+      type: 'modelMessageEvent',
+      agent: agent,
+      message: message,
+      stopReason: 'endTurn',
+    })
+    // @ts-expect-error verifying that property is readonly
+    event.agent = new Agent()
+    // @ts-expect-error verifying that property is readonly
+    event.message = message
+    // @ts-expect-error verifying that property is readonly
+    event.stopReason = 'endTurn'
+  })
+})
+
+describe('ToolResultEvent', () => {
+  it('creates instance with correct properties', () => {
+    const agent = new Agent()
+    const toolResult = new ToolResultBlock({
+      toolUseId: 'test-id',
+      status: 'success',
+      content: [new TextBlock('Result')],
+    })
+    const event = new ToolResultEvent({ agent, result: toolResult })
+
+    expect(event).toEqual({
+      type: 'toolResultEvent',
+      agent: agent,
+      result: toolResult,
+    })
+    // @ts-expect-error verifying that property is readonly
+    event.agent = new Agent()
+    // @ts-expect-error verifying that property is readonly
+    event.result = toolResult
+  })
+})
+
+describe('ToolStreamUpdateEvent', () => {
+  it('creates instance with correct properties', () => {
+    const agent = new Agent()
+    const toolStreamEvent = new ToolStreamEvent({ data: 'progress' })
+    const event = new ToolStreamUpdateEvent({ agent, event: toolStreamEvent })
+
+    expect(event).toEqual({
+      type: 'toolStreamUpdateEvent',
+      agent: agent,
+      event: toolStreamEvent,
+    })
+    // @ts-expect-error verifying that property is readonly
+    event.agent = new Agent()
+    // @ts-expect-error verifying that property is readonly
+    event.event = toolStreamEvent
+  })
+})
+
+describe('AgentResultEvent', () => {
+  it('creates instance with correct properties', () => {
+    const agent = new Agent()
+    const result = new AgentResult({
+      stopReason: 'endTurn',
+      lastMessage: new Message({ role: 'assistant', content: [new TextBlock('Done')] }),
+    })
+    const event = new AgentResultEvent({ agent, result })
+
+    expect(event).toEqual({
+      type: 'agentResultEvent',
+      agent: agent,
+      result: result,
+    })
+    // @ts-expect-error verifying that property is readonly
+    event.agent = new Agent()
+    // @ts-expect-error verifying that property is readonly
+    event.result = result
   })
 })
 
@@ -334,12 +488,11 @@ describe('BeforeToolsEvent', () => {
     const message = new Message({
       role: 'assistant',
       content: [
-        {
-          type: 'toolUseBlock',
+        new ToolUseBlock({
           name: 'testTool',
           toolUseId: 'test-id',
           input: { arg: 'value' },
-        },
+        }),
       ],
     })
     const event = new BeforeToolsEvent({ agent, message })
@@ -369,12 +522,11 @@ describe('AfterToolsEvent', () => {
     const message = new Message({
       role: 'user',
       content: [
-        {
-          type: 'toolResultBlock',
+        new ToolResultBlock({
           toolUseId: 'test-id',
           status: 'success',
-          content: [{ type: 'textBlock', text: 'Result' }],
-        },
+          content: [new TextBlock('Result')],
+        }),
       ],
     })
     const event = new AfterToolsEvent({ agent, message })

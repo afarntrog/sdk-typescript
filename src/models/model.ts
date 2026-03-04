@@ -124,6 +124,13 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
   abstract getConfig(): T
 
   /**
+   * The model ID from the current configuration, if configured.
+   */
+  get modelId(): string | undefined {
+    return this.getConfig().modelId
+  }
+
+  /**
    * Streams a conversation with the model.
    * Returns an async iterable that yields streaming events as they occur.
    *
@@ -197,6 +204,7 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
       let accumulatedToolInput = ''
       let toolName = ''
       let toolUseId = ''
+      let toolReasoningSignature = ''
       let accumulatedReasoning: {
         text?: string
         signature?: string
@@ -222,6 +230,7 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
             if (event.start?.type === 'toolUseStart') {
               toolName = event.start.name
               toolUseId = event.start.toolUseId
+              toolReasoningSignature = event.start.reasoningSignature ?? ''
             }
             accumulatedToolInput = ''
             accumulatedText = ''
@@ -253,9 +262,11 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
                   name: toolName,
                   toolUseId: toolUseId,
                   input: accumulatedToolInput ? JSON.parse(accumulatedToolInput) : {},
+                  ...(toolReasoningSignature && { reasoningSignature: toolReasoningSignature }),
                 })
                 toolUseId = '' // Reset
                 toolName = ''
+                toolReasoningSignature = ''
               } else if (Object.keys(accumulatedReasoning).length > 0) {
                 block = new ReasoningBlock({
                   ...accumulatedReasoning,

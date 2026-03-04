@@ -1,8 +1,10 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { takeResult } from '@modelcontextprotocol/sdk/shared/responseMessage.js'
+import { context, propagation, trace } from '@opentelemetry/api'
 import type { JSONSchema, JSONValue } from './types/json.js'
 import { McpTool } from './tools/mcp-tool.js'
+import { logger } from './logging/index.js'
 
 /** Temporary placeholder for RuntimeConfig */
 export interface RuntimeConfig {
@@ -11,7 +13,12 @@ export interface RuntimeConfig {
 }
 
 /** Arguments for configuring an MCP Client. */
-export type McpClientConfig = RuntimeConfig & { transport: Transport }
+export type McpClientConfig = RuntimeConfig & {
+  transport: Transport
+
+  /** Disable OpenTelemetry MCP instrumentation. */
+  disableMcpInstrumentation?: boolean
+}
 
 /** MCP Client for interacting with Model Context Protocol servers. */
 export class McpClient {
@@ -20,6 +27,7 @@ export class McpClient {
   private _transport: Transport
   private _connected: boolean
   private _client: Client
+  private _disableMcpInstrumentation: boolean
 
   constructor(args: McpClientConfig) {
     this._clientName = args.applicationName || 'strands-agents-ts-sdk'
@@ -30,6 +38,8 @@ export class McpClient {
       name: this._clientName,
       version: this._clientVersion,
     })
+
+    this._disableMcpInstrumentation = args.disableMcpInstrumentation ?? false
   }
 
   get client(): Client {
@@ -110,15 +120,61 @@ export class McpClient {
       )
     }
 
+    // Inject OpenTelemetry trace context into tool arguments for distributed tracing
+    const enhancedArgs = this._disableMcpInstrumentation ? args : injectTraceContext(args)
+
     // Using callToolStream which automatically handles both:
     // - Regular (non-task) tools: returns result immediately
     // - Task-augmented tools: handles taskCreated -> taskStatus -> result flow
     const stream = this._client.experimental.tasks.callToolStream({
       name: tool.name,
-      arguments: args as Record<string, unknown>,
+      arguments: enhancedArgs as Record<string, unknown>,
     })
 
     const result = await takeResult(stream)
     return result as JSONValue
+  }
+}
+
+/**
+ * Carrier object for OpenTelemetry context propagation.
+ */
+interface ContextCarrier {
+  [key: string]: string | string[] | undefined
+}
+
+/**
+ * Injects OpenTelemetry trace context into MCP tool call arguments.
+ * Returns the args with a `_meta` field containing W3C traceparent headers.
+ * If no active span exists or injection fails, returns the original args unchanged.
+ *
+ * @param args - The tool call arguments (must be a non-null object)
+ * @returns The args with trace context injected, or the original args on failure
+ */
+function injectTraceContext(args: JSONValue): JSONValue {
+  try {
+    const currentContext = context.active()
+    const currentSpan = trace.getSpan(currentContext)
+
+    if (!currentSpan || !currentSpan.spanContext().traceId) {
+      return args
+    }
+
+    const carrier: ContextCarrier = {}
+    propagation.inject(currentContext, carrier)
+
+    const existingMeta = (args as Record<string, unknown>)._meta
+    const mergedMeta =
+      existingMeta && typeof existingMeta === 'object' && !Array.isArray(existingMeta)
+        ? { ...existingMeta, ...carrier }
+        : carrier
+
+    return {
+      ...(args as Record<string, unknown>),
+      _meta: mergedMeta as unknown as JSONValue,
+    }
+  } catch (error) {
+    logger.warn(`error=<${error}> | failed to inject trace context into mcp tool call args`)
+    return args
   }
 }

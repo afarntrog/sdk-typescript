@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import { Agent, type ToolList } from '../agent.js'
 import { MockMessageModel } from '../../__fixtures__/mock-message-model.js'
 import { collectGenerator } from '../../__fixtures__/model-test-helpers.js'
@@ -18,9 +19,11 @@ import {
   VideoBlock,
   DocumentBlock,
 } from '../../index.js'
+import type { Usage } from '../../models/streaming.js'
 import { AgentPrinter } from '../printer.js'
 import { BeforeInvocationEvent, BeforeToolsEvent } from '../../hooks/events.js'
 import { BedrockModel } from '../../models/bedrock.js'
+import { StructuredOutputException } from '../../structured-output/exceptions.js'
 
 describe('Agent', () => {
   describe('stream', () => {
@@ -80,12 +83,15 @@ describe('Agent', () => {
           .addTurn({ type: 'toolUseBlock', name: 'testTool', toolUseId: 'tool-1', input: {} })
           .addTurn({ type: 'textBlock', text: 'Tool result processed' })
 
-        const tool = createMockTool('testTool', () => ({
-          type: 'toolResultBlock',
-          toolUseId: 'tool-1',
-          status: 'success' as const,
-          content: [new TextBlock('Tool executed')],
-        }))
+        const tool = createMockTool(
+          'testTool',
+          () =>
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success' as const,
+              content: [new TextBlock('Tool executed')],
+            })
+        )
 
         const agent = new Agent({ model, tools: [tool] })
 
@@ -106,12 +112,15 @@ describe('Agent', () => {
           .addTurn({ type: 'toolUseBlock', name: 'testTool', toolUseId: 'tool-1', input: {} })
           .addTurn({ type: 'textBlock', text: 'Done' })
 
-        const tool = createMockTool('testTool', () => ({
-          type: 'toolResultBlock',
-          toolUseId: 'tool-1',
-          status: 'success' as const,
-          content: [new TextBlock('Success')],
-        }))
+        const tool = createMockTool(
+          'testTool',
+          () =>
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success' as const,
+              content: [new TextBlock('Success')],
+            })
+        )
 
         const agent = new Agent({ model, tools: [tool] })
 
@@ -215,12 +224,15 @@ describe('Agent', () => {
           .addTurn({ type: 'toolUseBlock', name: 'calc', toolUseId: 'tool-1', input: { a: 1, b: 2 } })
           .addTurn({ type: 'textBlock', text: 'The answer is 3' })
 
-        const tool = createMockTool('calc', () => ({
-          type: 'toolResultBlock',
-          toolUseId: 'tool-1',
-          status: 'success' as const,
-          content: [new TextBlock('3')],
-        }))
+        const tool = createMockTool(
+          'calc',
+          () =>
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success' as const,
+              content: [new TextBlock('3')],
+            })
+        )
 
         const agent = new Agent({ model, tools: [tool] })
 
@@ -269,12 +281,15 @@ describe('Agent', () => {
           .addTurn({ type: 'toolUseBlock', name: 'testTool', toolUseId: 'id', input: {} })
           .addTurn({ type: 'textBlock', text: 'Final' })
 
-        const tool = createMockTool('testTool', () => ({
-          type: 'toolResultBlock',
-          toolUseId: 'id',
-          status: 'success' as const,
-          content: [new TextBlock('Tool ran')],
-        }))
+        const tool = createMockTool(
+          'testTool',
+          () =>
+            new ToolResultBlock({
+              toolUseId: 'id',
+              status: 'success' as const,
+              content: [new TextBlock('Tool ran')],
+            })
+        )
 
         return { model, tool }
       }
@@ -877,5 +892,305 @@ describe('Agent', () => {
         expect(agentWithString.model.getConfig().modelId).toBe(modelId)
       })
     })
+  })
+
+  describe('structured output', () => {
+    it('returns structured output when schema provided and tool used', async () => {
+      const schema = z.object({ name: z.string(), age: z.number() })
+
+      const model = new MockMessageModel()
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-1',
+          input: { name: 'John', age: 30 },
+        })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.structuredOutput).toEqual({ name: 'John', age: 30 })
+    })
+
+    it('forces structured output tool when model does not use it', async () => {
+      const schema = z.object({ value: z.number() })
+
+      const model = new MockMessageModel()
+        .addTurn({ type: 'textBlock', text: 'First response' })
+        .addTurn({ type: 'toolUseBlock', name: 'strands_structured_output', toolUseId: 'tool-1', input: { value: 42 } })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.structuredOutput).toEqual({ value: 42 })
+    })
+
+    it('throws StructuredOutputException when model refuses to use tool after forcing', async () => {
+      const schema = z.object({ value: z.number() })
+
+      // Model returns text twice - once normally, once when forced
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Response' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      await expect(agent.invoke('Test')).rejects.toThrow(StructuredOutputException)
+    })
+
+    it('throws MaxTokensError when maxTokens reached before structured output', async () => {
+      const schema = z.object({ value: z.number() })
+
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Partial...' }, 'maxTokens')
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      await expect(agent.invoke('Test')).rejects.toThrow(MaxTokensError)
+    })
+
+    it('retries with validation feedback when structured output tool returns error', async () => {
+      const schema = z.object({ name: z.string(), age: z.number() })
+
+      const model = new MockMessageModel()
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-1',
+          input: { name: 'John', age: 'invalid' },
+        })
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-2',
+          input: { name: 'John', age: 30 },
+        })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.structuredOutput).toEqual({ name: 'John', age: 30 })
+    })
+
+    it('works without structured output schema', async () => {
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })
+
+      const agent = new Agent({ model })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.structuredOutput).toBeUndefined()
+    })
+
+    it('cleans up structured output tool after invocation', async () => {
+      const schema = z.object({ value: z.number() })
+
+      const model = new MockMessageModel()
+        .addTurn({ type: 'toolUseBlock', name: 'strands_structured_output', toolUseId: 'tool-1', input: { value: 42 } })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      await agent.invoke('Test')
+
+      const toolNames = agent.tools.map((t) => t.name)
+      expect(toolNames).not.toContain('strands_structured_output')
+    })
+
+    it('cleans up structured output tool even when error occurs', async () => {
+      const schema = z.object({ value: z.number() })
+
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Partial...' }, 'maxTokens')
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      await expect(agent.invoke('Test')).rejects.toThrow()
+
+      const toolNames = agent.tools.map((t) => t.name)
+      expect(toolNames).not.toContain('strands_structured_output')
+    })
+
+    it('validates nested objects in structured output', async () => {
+      const schema = z.object({
+        user: z.object({
+          name: z.string(),
+          age: z.number(),
+        }),
+      })
+
+      const model = new MockMessageModel()
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-1',
+          input: { user: { name: 'Alice', age: 25 } },
+        })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.structuredOutput).toEqual({ user: { name: 'Alice', age: 25 } })
+    })
+
+    it('validates arrays in structured output', async () => {
+      const schema = z.object({
+        items: z.array(z.string()),
+      })
+
+      const model = new MockMessageModel()
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-1',
+          input: { items: ['a', 'b', 'c'] },
+        })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: schema })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.structuredOutput).toEqual({ items: ['a', 'b', 'c'] })
+    })
+
+    it('uses per-invocation override schema and restores constructor schema on next call', async () => {
+      const constructorSchema = z.object({ name: z.string() })
+      const overrideSchema = z.object({ value: z.number() })
+
+      const model = new MockMessageModel()
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-1',
+          input: { value: 99 },
+        })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+        .addTurn({
+          type: 'toolUseBlock',
+          name: 'strands_structured_output',
+          toolUseId: 'tool-2',
+          input: { name: 'Bob' },
+        })
+        .addTurn({ type: 'textBlock', text: 'Done' })
+
+      const agent = new Agent({ model, structuredOutputSchema: constructorSchema })
+
+      const first = await agent.invoke('First', { structuredOutputSchema: overrideSchema })
+      expect(first.structuredOutput).toEqual({ value: 99 })
+
+      const second = await agent.invoke('Second')
+      expect(second.structuredOutput).toEqual({ name: 'Bob' })
+    })
+  })
+})
+
+describe('Agent._createEmptyUsage', () => {
+  const createEmptyUsage = Agent['_createEmptyUsage']
+
+  it('returns a Usage object with all counters at zero', () => {
+    expect(createEmptyUsage()).toStrictEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    })
+  })
+
+  it('returns independent instances', () => {
+    const a = createEmptyUsage()
+    const b = createEmptyUsage()
+    a.inputTokens = 99
+
+    expect(b.inputTokens).toBe(0)
+  })
+})
+
+describe('Agent._accumulateUsage', () => {
+  const createEmptyUsage = Agent['_createEmptyUsage']
+  const accumulateUsage = Agent['_accumulateUsage']
+
+  it('accumulates basic token counts', () => {
+    const target = createEmptyUsage()
+    const source: Usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+
+    accumulateUsage(target, source)
+
+    expect(target).toStrictEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+    })
+  })
+
+  it('accumulates across multiple calls', () => {
+    const target = createEmptyUsage()
+
+    accumulateUsage(target, { inputTokens: 10, outputTokens: 5, totalTokens: 15 })
+    accumulateUsage(target, { inputTokens: 20, outputTokens: 10, totalTokens: 30 })
+
+    expect(target).toStrictEqual({
+      inputTokens: 30,
+      outputTokens: 15,
+      totalTokens: 45,
+    })
+  })
+
+  it('accumulates cache token counts when present in source', () => {
+    const target = createEmptyUsage()
+    const source: Usage = {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      cacheReadInputTokens: 3,
+      cacheWriteInputTokens: 2,
+    }
+
+    accumulateUsage(target, source)
+
+    expect(target).toStrictEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      cacheReadInputTokens: 3,
+      cacheWriteInputTokens: 2,
+    })
+  })
+
+  it('accumulates cache tokens across multiple calls', () => {
+    const target = createEmptyUsage()
+
+    accumulateUsage(target, {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      cacheReadInputTokens: 3,
+    })
+    accumulateUsage(target, {
+      inputTokens: 5,
+      outputTokens: 2,
+      totalTokens: 7,
+      cacheReadInputTokens: 4,
+    })
+
+    expect(target).toStrictEqual({
+      inputTokens: 15,
+      outputTokens: 7,
+      totalTokens: 22,
+      cacheReadInputTokens: 7,
+    })
+  })
+
+  it('does not add cache fields when source has no cache tokens', () => {
+    const target = createEmptyUsage()
+    const source: Usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+
+    accumulateUsage(target, source)
+
+    expect(target).not.toHaveProperty('cacheReadInputTokens')
+    expect(target).not.toHaveProperty('cacheWriteInputTokens')
   })
 })

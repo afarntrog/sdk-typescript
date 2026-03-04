@@ -1,8 +1,5 @@
-import type { AgentState } from '../agent/state.js'
+import type { AppState } from '../app-state.js'
 import type { Message, StopReason } from './messages.js'
-import type { ModelStreamEvent } from '../models/streaming.js'
-import { ToolStreamEvent } from '../tools/tool.js'
-import type { ContentBlock } from './messages.js'
 import type {
   BeforeInvocationEvent,
   AfterInvocationEvent,
@@ -13,8 +10,14 @@ import type {
   BeforeToolCallEvent,
   AfterToolCallEvent,
   MessageAddedEvent,
-  ModelStreamEventHook,
+  ModelStreamUpdateEvent,
+  ContentBlockEvent,
+  ModelMessageEvent,
+  ToolResultEvent,
+  ToolStreamUpdateEvent,
+  AgentResultEvent,
 } from '../hooks/events.js'
+import type { z } from 'zod'
 
 /**
  * Interface for objects that provide agent state.
@@ -22,9 +25,9 @@ import type {
  */
 export interface AgentData {
   /**
-   * Agent state storage accessible to tools and application logic.
+   * App state storage accessible to tools and application logic.
    */
-  state: AgentState
+  state: AppState
 
   /**
    * The conversation history of messages between user and assistant.
@@ -48,9 +51,18 @@ export class AgentResult {
    */
   readonly lastMessage: Message
 
-  constructor(data: { stopReason: StopReason; lastMessage: Message }) {
+  /**
+   * The validated structured output from the LLM, if a schema was provided.
+   * Type represents any validated Zod schema output.
+   */
+  readonly structuredOutput?: z.output<z.ZodType>
+
+  constructor(data: { stopReason: StopReason; lastMessage: Message; structuredOutput?: z.output<z.ZodType> }) {
     this.stopReason = data.stopReason
     this.lastMessage = data.lastMessage
+    if (data.structuredOutput !== undefined) {
+      this.structuredOutput = data.structuredOutput
+    }
   }
 
   /**
@@ -91,13 +103,17 @@ export class AgentResult {
  * This is a discriminated union where each event has a unique type field,
  * allowing for type-safe event handling using switch statements.
  *
- * Note: All agent lifecycle events are Hook Event instances, providing
- * consistent structure with agent reference and extensibility features.
+ * Every member extends {@link HookableEvent} (which extends {@link StreamEvent}),
+ * making all events both streamable and subscribable via hook callbacks.
+ * Raw data objects from lower layers (model, tools) should be wrapped
+ * in a StreamEvent subclass at the agent boundary rather than added directly.
  */
 export type AgentStreamEvent =
-  | ModelStreamEvent
-  | ContentBlock
-  | ToolStreamEvent
+  | ModelStreamUpdateEvent
+  | ContentBlockEvent
+  | ModelMessageEvent
+  | ToolStreamUpdateEvent
+  | ToolResultEvent
   | BeforeInvocationEvent
   | AfterInvocationEvent
   | BeforeModelCallEvent
@@ -107,5 +123,4 @@ export type AgentStreamEvent =
   | BeforeToolCallEvent
   | AfterToolCallEvent
   | MessageAddedEvent
-  | ModelStreamEventHook
-  | AgentResult
+  | AgentResultEvent

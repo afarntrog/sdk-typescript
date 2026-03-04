@@ -5,6 +5,8 @@
  * with support for multiple sources (bytes, S3, URLs, files).
  */
 
+import type { Serialized, MaybeSerializedInput, JSONSerializable } from './json.js'
+import { omitUndefined } from './json.js'
 import { TextBlock, type TextBlockData } from './messages.js'
 
 export type MediaFormats = DocumentFormat | ImageFormat | VideoFormat
@@ -57,12 +59,54 @@ export function getMimeType(format: string): string | undefined {
 /**
  * Cross-platform base64 encoding function that works in both browser and Node.js environments.
  */
-export function encodeBase64(str: string): string {
-  if (typeof globalThis.btoa === 'function') {
-    return globalThis.btoa(str)
+export function encodeBase64(input: string | Uint8Array): string {
+  // Handle Uint8Array (Image/PDF bytes)
+  if (input instanceof Uint8Array) {
+    // Node.js: Fast and zero copy
+    if (typeof globalThis.Buffer === 'function') {
+      return globalThis.Buffer.from(input).toString('base64')
+    }
+
+    // Browser: Safe conversion which doesn't cause a stack overflow like when using the spread operator.
+    // We convert bytes to binary string in chunks to satisfy btoa()
+    const CHUNK_SIZE = 0x8000 // 32k chunks
+    let binary = ''
+    for (let i = 0; i < input.length; i += CHUNK_SIZE) {
+      binary += String.fromCharCode.apply(
+        null,
+        input.subarray(i, Math.min(i + CHUNK_SIZE, input.length)) as unknown as number[]
+      )
+    }
+
+    return globalThis.btoa(binary)
   }
-  // Node.js environment
-  return globalThis.Buffer.from(str, 'binary').toString('base64')
+
+  if (typeof globalThis.btoa === 'function') {
+    return globalThis.btoa(input)
+  }
+
+  return globalThis.Buffer.from(input, 'binary').toString('base64')
+}
+
+/**
+ * Cross-platform base64 decoding function that works in both browser and Node.js environments.
+ *
+ * @param input - Base64 encoded string to decode
+ * @returns Decoded bytes as Uint8Array
+ */
+export function decodeBase64(input: string): Uint8Array {
+  // Node.js: Fast path using Buffer
+  if (typeof globalThis.Buffer === 'function') {
+    return new Uint8Array(globalThis.Buffer.from(input, 'base64'))
+  }
+
+  // Browser: Use atob to decode base64 to binary string, then convert to bytes
+  const binary = globalThis.atob(input)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes
 }
 
 /**
@@ -85,7 +129,7 @@ export interface S3LocationData {
 /**
  * S3 location for Bedrock media and document sources.
  */
-export class S3Location implements S3LocationData {
+export class S3Location implements S3LocationData, JSONSerializable<S3LocationData> {
   readonly uri: string
   readonly bucketOwner?: string
 
@@ -94,6 +138,27 @@ export class S3Location implements S3LocationData {
     if (data.bucketOwner !== undefined) {
       this.bucketOwner = data.bucketOwner
     }
+  }
+
+  /**
+   * Serializes the S3Location to a JSON-compatible S3LocationData object.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): S3LocationData {
+    return omitUndefined({
+      uri: this.uri,
+      bucketOwner: this.bucketOwner,
+    })
+  }
+
+  /**
+   * Creates an S3Location instance from S3LocationData.
+   *
+   * @param data - S3LocationData to deserialize
+   * @returns S3Location instance
+   */
+  static fromJSON(data: S3LocationData): S3Location {
+    return new S3Location(data)
   }
 }
 
@@ -137,7 +202,7 @@ export interface ImageBlockData {
 /**
  * Image content block.
  */
-export class ImageBlock implements ImageBlockData {
+export class ImageBlock implements ImageBlockData, JSONSerializable<{ image: Serialized<ImageBlockData> }> {
   /**
    * Discriminator for image content.
    */
@@ -179,6 +244,52 @@ export class ImageBlock implements ImageBlockData {
     }
     throw new Error('Invalid image source')
   }
+
+  /**
+   * Serializes the ImageBlock to a JSON-compatible ContentBlockData object.
+   * Called automatically by JSON.stringify().
+   * Uint8Array bytes are encoded as base64 string.
+   */
+  toJSON(): { image: Serialized<ImageBlockData> } {
+    let source: Serialized<ImageSourceData>
+    if (this.source.type === 'imageSourceBytes') {
+      source = { bytes: encodeBase64(this.source.bytes) }
+    } else if (this.source.type === 'imageSourceUrl') {
+      source = { url: this.source.url }
+    } else {
+      source = { s3Location: this.source.s3Location.toJSON() }
+    }
+    return {
+      image: {
+        format: this.format,
+        source,
+      },
+    }
+  }
+
+  /**
+   * Creates an ImageBlock instance from its wrapped data format.
+   * Base64-encoded bytes are decoded back to Uint8Array.
+   *
+   * @param data - Wrapped ImageBlockData to deserialize (accepts both string and Uint8Array for bytes)
+   * @returns ImageBlock instance
+   */
+  static fromJSON(data: { image: MaybeSerializedInput<ImageBlockData> }): ImageBlock {
+    const image = data.image
+    let source: ImageSourceData
+    if ('bytes' in image.source) {
+      const bytes = image.source.bytes
+      source = { bytes: typeof bytes === 'string' ? decodeBase64(bytes) : bytes }
+    } else if ('url' in image.source) {
+      source = { url: image.source.url }
+    } else {
+      source = { s3Location: image.source.s3Location }
+    }
+    return new ImageBlock({
+      format: image.format,
+      source,
+    })
+  }
 }
 
 /**
@@ -216,7 +327,7 @@ export interface VideoBlockData {
 /**
  * Video content block.
  */
-export class VideoBlock implements VideoBlockData {
+export class VideoBlock implements VideoBlockData, JSONSerializable<{ video: Serialized<VideoBlockData> }> {
   /**
    * Discriminator for video content.
    */
@@ -248,6 +359,48 @@ export class VideoBlock implements VideoBlockData {
       return { type: 'videoSourceS3Location', s3Location: new S3Location(source.s3Location) }
     }
     throw new Error('Invalid video source')
+  }
+
+  /**
+   * Serializes the VideoBlock to a JSON-compatible ContentBlockData object.
+   * Called automatically by JSON.stringify().
+   * Uint8Array bytes are encoded as base64 string.
+   */
+  toJSON(): { video: Serialized<VideoBlockData> } {
+    let source: Serialized<VideoSourceData>
+    if (this.source.type === 'videoSourceBytes') {
+      source = { bytes: encodeBase64(this.source.bytes) }
+    } else {
+      source = { s3Location: this.source.s3Location.toJSON() }
+    }
+    return {
+      video: {
+        format: this.format,
+        source,
+      },
+    }
+  }
+
+  /**
+   * Creates a VideoBlock instance from its wrapped data format.
+   * Base64-encoded bytes are decoded back to Uint8Array.
+   *
+   * @param data - Wrapped VideoBlockData to deserialize (accepts both string and Uint8Array for bytes)
+   * @returns VideoBlock instance
+   */
+  static fromJSON(data: { video: MaybeSerializedInput<VideoBlockData> }): VideoBlock {
+    const video = data.video
+    let source: VideoSourceData
+    if ('bytes' in video.source) {
+      const bytes = video.source.bytes
+      source = { bytes: typeof bytes === 'string' ? decodeBase64(bytes) : bytes }
+    } else {
+      source = { s3Location: video.source.s3Location }
+    }
+    return new VideoBlock({
+      format: video.format,
+      source,
+    })
   }
 }
 
@@ -315,7 +468,7 @@ export interface DocumentBlockData {
 /**
  * Document content block.
  */
-export class DocumentBlock implements DocumentBlockData {
+export class DocumentBlock implements DocumentBlockData, JSONSerializable<{ document: Serialized<DocumentBlockData> }> {
   /**
    * Discriminator for document content.
    */
@@ -384,5 +537,66 @@ export class DocumentBlock implements DocumentBlockData {
       }
     }
     throw new Error('Invalid document source')
+  }
+
+  /**
+   * Serializes the DocumentBlock to a JSON-compatible ContentBlockData object.
+   * Called automatically by JSON.stringify().
+   * Uint8Array bytes are encoded as base64 string.
+   */
+  toJSON(): { document: Serialized<DocumentBlockData> } {
+    let source: Serialized<DocumentSourceData>
+    if (this.source.type === 'documentSourceBytes') {
+      source = { bytes: encodeBase64(this.source.bytes) }
+    } else if (this.source.type === 'documentSourceText') {
+      source = { text: this.source.text }
+    } else if (this.source.type === 'documentSourceContentBlock') {
+      source = { content: this.source.content.map((block) => block.toJSON()) }
+    } else {
+      source = { s3Location: this.source.s3Location.toJSON() }
+    }
+    return {
+      document: omitUndefined({
+        name: this.name,
+        format: this.format,
+        source,
+        citations: this.citations,
+        context: this.context,
+      }),
+    }
+  }
+
+  /**
+   * Creates a DocumentBlock instance from its wrapped data format.
+   * Base64-encoded bytes are decoded back to Uint8Array.
+   *
+   * @param data - Wrapped DocumentBlockData to deserialize (accepts both string and Uint8Array for bytes)
+   * @returns DocumentBlock instance
+   */
+  static fromJSON(data: { document: MaybeSerializedInput<DocumentBlockData> }): DocumentBlock {
+    const doc = data.document
+    let source: DocumentSourceData
+    if ('bytes' in doc.source) {
+      const bytes = doc.source.bytes
+      source = { bytes: typeof bytes === 'string' ? decodeBase64(bytes) : bytes }
+    } else if ('text' in doc.source) {
+      source = { text: doc.source.text }
+    } else if ('content' in doc.source) {
+      source = { content: doc.source.content }
+    } else {
+      source = { s3Location: doc.source.s3Location }
+    }
+    const result: DocumentBlockData = {
+      name: doc.name,
+      format: doc.format,
+      source,
+    }
+    if (doc.citations !== undefined) {
+      result.citations = doc.citations
+    }
+    if (doc.context !== undefined) {
+      result.context = doc.context
+    }
+    return new DocumentBlock(result)
   }
 }
