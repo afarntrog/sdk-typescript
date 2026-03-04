@@ -14,22 +14,24 @@ import {
   type SystemPromptData,
   TextBlock,
   type Tool,
+  type ToolChoice,
   type ToolContext,
   ToolResultBlock,
   ToolUseBlock,
 } from '../index.js'
 import { systemPromptFromData } from '../types/messages.js'
-import { normalizeError, ConcurrentInvocationError } from '../errors.js'
-import type { BaseModelConfig, Model, StreamOptions } from '../models/model.js'
+import { normalizeError, ConcurrentInvocationError, MaxTokensError } from '../errors.js'
+import { Model } from '../models/model.js'
+import type { BaseModelConfig, StreamOptions } from '../models/model.js'
+import { isModelStreamEvent } from '../models/streaming.js'
 import { ToolRegistry } from '../registry/tool-registry.js'
-import { AgentState } from './state.js'
+import { AppState } from '../app-state.js'
 import type { AgentData } from '../types/agent.js'
 import { AgentPrinter, getDefaultAppender, type Printer } from './printer.js'
 import type { HookProvider } from '../hooks/types.js'
 import { SlidingWindowConversationManager } from '../conversation-manager/sliding-window-conversation-manager.js'
 import { HookRegistryImplementation } from '../hooks/registry.js'
 import {
-  HookEvent,
   InitializedEvent,
   AfterInvocationEvent,
   AfterModelCallEvent,
@@ -39,9 +41,21 @@ import {
   BeforeModelCallEvent,
   BeforeToolCallEvent,
   BeforeToolsEvent,
+  HookableEvent,
   MessageAddedEvent,
-  ModelStreamEventHook,
+  ModelStreamUpdateEvent,
+  ContentBlockEvent,
+  ModelMessageEvent,
+  ToolResultEvent,
+  AgentResultEvent,
+  ToolStreamUpdateEvent,
 } from '../hooks/events.js'
+import { createStructuredOutputContext } from '../structured-output/context.js'
+import { StructuredOutputException } from '../structured-output/exceptions.js'
+import type { z } from 'zod'
+import { Tracer } from '../telemetry/tracer.js'
+import type { Usage } from '../models/streaming.js'
+import type { AttributeValue } from '@opentelemetry/api'
 
 /**
  * Recursive type definition for nested tool arrays.
@@ -105,6 +119,24 @@ export type AgentConfig = {
    * Hooks enable observing and extending agent behavior.
    */
   hooks?: HookProvider[]
+  /**
+   * Zod schema for structured output validation.
+   */
+  structuredOutputSchema?: z.ZodSchema
+  /**
+   * Custom trace attributes to include in all spans.
+   * These attributes are merged with standard attributes in telemetry spans.
+   * Telemetry must be enabled globally via telemetry.setupTracer() for these to take effect.
+   */
+  traceAttributes?: Record<string, AttributeValue>
+  /**
+   * Optional name for the agent. Defaults to "Strands Agent".
+   */
+  name?: string
+  /**
+   * Optional unique identifier for the agent. Defaults to "default".
+   */
+  agentId?: string
 }
 
 /**
@@ -118,6 +150,22 @@ export type AgentConfig = {
 export type InvokeArgs = string | ContentBlock[] | ContentBlockData[] | Message[] | MessageData[]
 
 /**
+ * Options for a single agent invocation.
+ */
+export interface InvokeOptions {
+  /**
+   * Zod schema for structured output validation, overriding the constructor-provided schema for this invocation only.
+   */
+  structuredOutputSchema?: z.ZodSchema
+}
+
+/** Fallback name used when no agent name is provided in the config. */
+const DEFAULT_AGENT_NAME = 'Strands Agent'
+
+/** Fallback agent ID used when no agent ID is provided in the config. */
+const DEFAULT_AGENT_ID = 'default'
+
+/**
  * Orchestrates the interaction between a model, a set of tools, and MCP clients.
  * The Agent is responsible for managing the lifecycle of tools and clients
  * and invoking the core decision-making loop.
@@ -128,10 +176,10 @@ export class Agent implements AgentData {
    */
   public readonly messages: Message[]
   /**
-   * Agent state storage accessible to tools and application logic.
+   * App state storage accessible to tools and application logic.
    * State is not passed to the model during inference.
    */
-  public readonly state: AgentState
+  public readonly state: AppState
   /**
    * Conversation manager for handling message history and context overflow.
    */
@@ -152,11 +200,26 @@ export class Agent implements AgentData {
    */
   public systemPrompt?: SystemPrompt
 
+  /**
+   * The name of the agent.
+   */
+  public readonly name: string
+
+  /**
+   * The unique identifier of the agent instance.
+   */
+  public readonly agentId: string
+
   private _toolRegistry: ToolRegistry
   private _mcpClients: McpClient[]
   private _initialized: boolean
   private _isInvoking: boolean = false
   private _printer?: Printer
+  private _structuredOutputSchema?: z.ZodSchema | undefined
+  /** Tracer instance for creating and managing OpenTelemetry spans. */
+  private _tracer: Tracer
+  /** Running total of token usage across all model invocations in the current invocation. */
+  private _accumulatedTokenUsage: Usage = Agent._createEmptyUsage()
 
   /**
    * Creates an instance of the Agent.
@@ -165,8 +228,10 @@ export class Agent implements AgentData {
   constructor(config?: AgentConfig) {
     // Initialize public fields
     this.messages = (config?.messages ?? []).map((msg) => (msg instanceof Message ? msg : Message.fromMessageData(msg)))
-    this.state = new AgentState(config?.state)
+    this.state = new AppState(config?.state)
     this.conversationManager = config?.conversationManager ?? new SlidingWindowConversationManager({ windowSize: 40 })
+    this.name = config?.name ?? DEFAULT_AGENT_NAME
+    this.agentId = config?.agentId ?? DEFAULT_AGENT_ID
 
     // Initialize hooks and register conversation manager hooks
     this.hooks = new HookRegistryImplementation()
@@ -192,6 +257,12 @@ export class Agent implements AgentData {
     if (printer) {
       this._printer = new AgentPrinter(getDefaultAppender())
     }
+
+    // Store structured output schema
+    this._structuredOutputSchema = config?.structuredOutputSchema
+
+    // Initialize tracer - OTEL returns no-op tracer if not configured
+    this._tracer = new Tracer(config?.traceAttributes)
 
     this._initialized = false
   }
@@ -254,6 +325,7 @@ export class Agent implements AgentData {
    * streaming events.
    *
    * @param args - Arguments for invoking the agent
+   * @param options - Optional per-invocation options
    * @returns Promise that resolves to the final AgentResult
    *
    * @example
@@ -263,8 +335,8 @@ export class Agent implements AgentData {
    * console.log(result.lastMessage) // Agent's response
    * ```
    */
-  public async invoke(args: InvokeArgs): Promise<AgentResult> {
-    const gen = this.stream(args)
+  public async invoke(args: InvokeArgs, options?: InvokeOptions): Promise<AgentResult> {
+    const gen = this.stream(args, options)
     let result = await gen.next()
     while (!result.done) {
       result = await gen.next()
@@ -289,6 +361,7 @@ export class Agent implements AgentData {
    * with valid toolResponses
    *
    * @param args - Arguments for invoking the agent
+   * @param options - Optional per-invocation options
    * @returns Async generator that yields AgentStreamEvent objects and returns AgentResult
    *
    * @example
@@ -301,20 +374,24 @@ export class Agent implements AgentData {
    * // Messages array is mutated in place and contains the full conversation
    * ```
    */
-  public async *stream(args: InvokeArgs): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
+  public async *stream(
+    args: InvokeArgs,
+    options?: InvokeOptions
+  ): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
     using _lock = this.acquireLock()
 
     await this.initialize()
 
     // Delegate to _stream and process events through printer and hooks
-    const streamGenerator = this._stream(args)
+    const streamGenerator = this._stream(args, options)
     let result = await streamGenerator.next()
 
     while (!result.done) {
       const event = result.value
 
-      // Invoke hook callbacks for Hook Events (except MessageAddedEvent which invokes in _appendMessage)
-      if (event instanceof HookEvent && !(event instanceof MessageAddedEvent)) {
+      // Invoke hook callbacks for hookable events (all current events are hookable;
+      // the guard exists for future StreamEvent subclasses that may not be)
+      if (event instanceof HookableEvent) {
         await this.hooks.invokeCallbacks(event)
       }
 
@@ -324,7 +401,10 @@ export class Agent implements AgentData {
     }
 
     // Yield final result as last event
-    yield result.value
+    const agentResultEvent = new AgentResultEvent({ agent: this, result: result.value })
+    await this.hooks.invokeCallbacks(agentResultEvent)
+    this._printer?.processEvent(agentResultEvent)
+    yield agentResultEvent
 
     return result.value
   }
@@ -334,40 +414,143 @@ export class Agent implements AgentData {
    * Separated to centralize printer event processing in the public stream method.
    *
    * @param args - Arguments for invoking the agent
+   * @param options - Optional per-invocation options
    * @returns Async generator that yields AgentStreamEvent objects and returns AgentResult
    */
-  private async *_stream(args: InvokeArgs): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
+  private async *_stream(
+    args: InvokeArgs,
+    options?: InvokeOptions
+  ): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
     let currentArgs: InvokeArgs | undefined = args
+    let forcedToolChoice: ToolChoice | undefined = undefined
+    let result: AgentResult | undefined
 
-    // Emit event before the loop starts
+    // Create structured output context (uses null object pattern when no schema)
+    const schema = options?.structuredOutputSchema ?? this._structuredOutputSchema
+    const context = createStructuredOutputContext(schema)
+
+    // Emit event before the try block
     yield new BeforeInvocationEvent({ agent: this })
 
+    // Normalize input to get the user messages for telemetry
+    const inputMessages = this._normalizeInput(args)
+
+    // Start agent trace span
+    this._accumulatedTokenUsage = Agent._createEmptyUsage()
+    const agentModelId = this.model.modelId
+    const agentSpanOptions: Parameters<Tracer['startAgentSpan']>[0] = {
+      messages: inputMessages,
+      agentName: this.name,
+      agentId: this.agentId,
+      tools: this.tools,
+    }
+    if (agentModelId) agentSpanOptions.modelId = agentModelId
+    if (this.systemPrompt) agentSpanOptions.systemPrompt = this.systemPrompt
+    const agentSpan = this._tracer.startAgentSpan(agentSpanOptions)
+
+    let caughtError: Error | undefined
     try {
+      // Register structured output tool
+      context.registerTool(this._toolRegistry)
+
       // Main agent loop - continues until model stops without requesting tools
-      while (true) {
-        const modelResult = yield* this.invokeModel(currentArgs)
-        currentArgs = undefined // Only pass args on first invocation
-        if (modelResult.stopReason !== 'toolUse') {
-          // Loop terminates - no tool use requested
-          // Add assistant message now that we're returning
-          yield await this._appendMessage(modelResult.message)
-          return new AgentResult({
-            stopReason: modelResult.stopReason,
-            lastMessage: modelResult.message,
-          })
+      for (let cycleCount = 1; ; cycleCount++) {
+        // Create agent loop cycle span within agent span context
+        const cycleSpan = this._tracer.startAgentLoopSpan({
+          cycleId: `cycle-${cycleCount}`,
+          messages: this.messages,
+        })
+
+        try {
+          const modelResult = yield* this.invokeModel(currentArgs, forcedToolChoice)
+          currentArgs = undefined // Only pass args on first invocation
+          const wasForced = forcedToolChoice !== undefined
+          forcedToolChoice = undefined // Clear after use
+
+          if (modelResult.stopReason !== 'toolUse') {
+            // Special handling for maxTokens - always fail regardless of whether we have structured output
+            if (modelResult.stopReason === 'maxTokens') {
+              throw new MaxTokensError(
+                'The model reached maxTokens before producing structured output. Consider increasing maxTokens in your model configuration.',
+                modelResult.message
+              )
+            }
+
+            // Check if we need to force structured output tool
+            if (!context.hasResult()) {
+              if (wasForced) {
+                // Already tried forcing - LLM refused to use the tool
+                throw new StructuredOutputException(
+                  'The model failed to invoke the structured output tool even after it was forced.'
+                )
+              }
+
+              // Force the model to use the structured output tool
+              const toolName = context.getToolName()
+              forcedToolChoice = { tool: { name: toolName } }
+              this._tracer.endAgentLoopSpan(cycleSpan)
+              continue
+            }
+
+            // Loop terminates - no tool use requested (and structured output satisfied if needed)
+            yield this._appendMessage(modelResult.message)
+
+            // End cycle span
+            this._tracer.endAgentLoopSpan(cycleSpan)
+
+            const structuredOutput = context.getResult()
+            result = new AgentResult({
+              stopReason: modelResult.stopReason,
+              lastMessage: modelResult.message,
+              structuredOutput,
+            })
+            return result
+          }
+
+          // Execute tools sequentially
+          const toolResultMessage = yield* this.executeTools(modelResult.message, this._toolRegistry)
+
+          /**
+           * Deferred append: both messages are added AFTER tool execution completes.
+           * This keeps agent.messages in a valid, reinvokable state at all times:
+           *
+           * - If interrupted during tool execution, messages has no dangling toolUse
+           *   without a matching toolResult, so the agent can be reinvoked cleanly.
+           * - The Python SDK appends the assistant message BEFORE tool execution,
+           *   requiring recovery logic (generate_missing_tool_result_content) on
+           *   interrupts. We avoid that by deferring.
+           * - Trade-off: MessageAddedEvent for the assistant message fires after tools
+           *   complete (not before as in Python), and agent.messages is incomplete
+           *   during tool execution. Events like BeforeToolsEvent.message and
+           *   BeforeToolCallEvent.toolUse provide the data directly.
+           */
+          yield this._appendMessage(modelResult.message)
+          yield this._appendMessage(toolResultMessage)
+
+          // End cycle span
+          this._tracer.endAgentLoopSpan(cycleSpan)
+
+          // Continue loop
+        } catch (error) {
+          // End cycle span with error
+          this._tracer.endAgentLoopSpan(cycleSpan, { error: error as Error })
+          throw error
         }
-
-        // Execute tools sequentially
-        const toolResultMessage = yield* this.executeTools(modelResult.message, this._toolRegistry)
-
-        // Add assistant message with tool uses right before adding tool results
-        // This ensures we don't have dangling tool use messages if tool execution fails
-        yield await this._appendMessage(modelResult.message)
-        yield await this._appendMessage(toolResultMessage)
-
-        // Continue loop
       }
+    } catch (error) {
+      caughtError = error as Error
+      throw error
     } finally {
+      this._tracer.endAgentSpan(agentSpan, {
+        ...(caughtError && { error: caughtError }),
+        ...(result?.lastMessage && { response: result.lastMessage }),
+        accumulatedUsage: this._accumulatedTokenUsage,
+        ...(result?.stopReason && { stopReason: result.stopReason }),
+      })
+
+      // Cleanup structured output context
+      context.cleanup(this._toolRegistry)
+
       // Always emit final event
       yield new AfterInvocationEvent({ agent: this })
     }
@@ -431,15 +614,17 @@ export class Agent implements AgentData {
    * Invokes the model provider and streams all events.
    *
    * @param args - Optional arguments for invoking the model
+   * @param toolChoice - Optional tool choice to force specific tool usage
    * @returns Object containing the assistant message and stop reason
    */
   private async *invokeModel(
-    args?: InvokeArgs
+    args?: InvokeArgs,
+    forcedToolChoice?: ToolChoice
   ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: StopReason }, undefined> {
     // Normalize input and append messages to conversation
     const messagesToAppend = this._normalizeInput(args)
     for (const message of messagesToAppend) {
-      yield await this._appendMessage(message)
+      yield this._appendMessage(message)
     }
 
     const toolSpecs = this._toolRegistry.values().map((tool) => tool.toolSpec)
@@ -448,10 +633,32 @@ export class Agent implements AgentData {
       streamOptions.systemPrompt = this.systemPrompt
     }
 
+    // Add tool choice if provided (for structured output forcing)
+    if (forcedToolChoice) {
+      streamOptions.toolChoice = forcedToolChoice
+    }
+
     yield new BeforeModelCallEvent({ agent: this })
 
+    // Start model span within loop span context
+    const modelId = this.model.modelId
+    const modelSpan = this._tracer.startModelInvokeSpan({
+      messages: this.messages,
+      ...(modelId && { modelId }),
+    })
+
     try {
-      const { message, stopReason } = yield* this._streamFromModel(this.messages, streamOptions)
+      const { message, stopReason, usage } = yield* this._streamFromModel(this.messages, streamOptions)
+
+      // Accumulate token usage
+      if (usage) {
+        Agent._accumulateUsage(this._accumulatedTokenUsage, usage)
+      }
+
+      // End model span with usage
+      this._tracer.endModelInvokeSpan(modelSpan, { output: message, stopReason, ...(usage && { usage }) })
+
+      yield new ModelMessageEvent({ agent: this, message, stopReason })
 
       const afterModelCallEvent = new AfterModelCallEvent({ agent: this, stopData: { message, stopReason } })
       yield afterModelCallEvent
@@ -463,6 +670,9 @@ export class Agent implements AgentData {
       return { message, stopReason }
     } catch (error) {
       const modelError = normalizeError(error)
+
+      // End model span with error
+      this._tracer.endModelInvokeSpan(modelSpan, { error: modelError })
 
       // Create error event
       const errorEvent = new AfterModelCallEvent({ agent: this, error: modelError })
@@ -481,7 +691,16 @@ export class Agent implements AgentData {
   }
 
   /**
-   * Streams events from the model and fires ModelStreamEventHook for each event.
+   * Streams events from the model and dispatches appropriate events for each.
+   *
+   * The model's `streamAggregated()` yields two kinds of output:
+   * - **ModelStreamEvent**: Transient streaming deltas (partial data while generating).
+   *   Wrapped in {@link ModelStreamUpdateEvent} before yielding.
+   * - **ContentBlock**: Fully assembled results (after all deltas accumulate).
+   *   Wrapped in {@link ContentBlockEvent} before yielding.
+   *
+   * These are separate event classes because they represent different granularities
+   * (partial deltas vs finished blocks). Both are yielded in the stream and hookable.
    *
    * @param messages - Messages to send to the model
    * @param streamOptions - Options for streaming
@@ -490,23 +709,28 @@ export class Agent implements AgentData {
   private async *_streamFromModel(
     messages: Message[],
     streamOptions: StreamOptions
-  ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: StopReason }, undefined> {
+  ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: StopReason; usage?: Usage }, undefined> {
     const streamGenerator = this.model.streamAggregated(messages, streamOptions)
     let result = await streamGenerator.next()
 
     while (!result.done) {
       const event = result.value
 
-      // Yield hook event for observability
-      yield new ModelStreamEventHook({ agent: this, event })
-
-      // Yield the actual model event
-      yield event
+      if (isModelStreamEvent(event)) {
+        // ModelStreamEvent: wrap in ModelStreamUpdateEvent
+        yield new ModelStreamUpdateEvent({ agent: this, event })
+      } else {
+        // ContentBlock: wrap in ContentBlockEvent
+        yield new ContentBlockEvent({ agent: this, contentBlock: event })
+      }
       result = await streamGenerator.next()
     }
 
     // result.done is true, result.value contains the return value
-    return result.value
+    const { message, stopReason, metadata } = result.value
+    const returnValue: { message: Message; stopReason: StopReason; usage?: Usage } = { message, stopReason }
+    if (metadata?.usage) returnValue.usage = metadata.usage
+    return returnValue
   }
 
   /**
@@ -538,8 +762,8 @@ export class Agent implements AgentData {
       const toolResultBlock = yield* this.executeTool(toolUseBlock, toolRegistry)
       toolResultBlocks.push(toolResultBlock)
 
-      // Yield the tool result block as it's created
-      yield toolResultBlock
+      // Yield the tool result event as it's created
+      yield new ToolResultEvent({ agent: this, result: toolResultBlock })
     }
 
     // Create user message with tool results
@@ -569,7 +793,7 @@ export class Agent implements AgentData {
   ): AsyncGenerator<AgentStreamEvent, ToolResultBlock, undefined> {
     const tool = toolRegistry.find((t) => t.name === toolUseBlock.name)
 
-    // Create toolUse object for hook events
+    // Create toolUse object for hook events and telemetry
     const toolUse = {
       name: toolUseBlock.name,
       toolUseId: toolUseBlock.toolUseId,
@@ -579,6 +803,11 @@ export class Agent implements AgentData {
     // Retry loop for tool execution
     while (true) {
       yield new BeforeToolCallEvent({ agent: this, toolUse, tool })
+
+      // Start tool span within loop span context
+      const toolSpan = this._tracer.startToolCallSpan({
+        tool: toolUse,
+      })
 
       let toolResult: ToolResultBlock
       let error: Error | undefined
@@ -591,7 +820,7 @@ export class Agent implements AgentData {
           content: [new TextBlock(`Tool '${toolUseBlock.name}' not found in registry`)],
         })
       } else {
-        // Execute tool and collect result
+        // Execute tool within the tool span context
         const toolContext: ToolContext = {
           toolUse: {
             name: toolUseBlock.name,
@@ -602,7 +831,18 @@ export class Agent implements AgentData {
         }
 
         try {
-          const result = yield* tool.stream(toolContext)
+          // Manually iterate tool stream to wrap each ToolStreamEvent in ToolStreamUpdateEvent.
+          // This keeps the tool authoring interface unchanged — tools construct ToolStreamEvent
+          // without knowledge of agents or hooks, and we wrap at the boundary.
+          // Tool execution is ran within the tool span's context so that
+          // downstream calls (e.g., MCP clients) can propagate trace context
+          const toolGenerator = this._tracer.withSpanContext(toolSpan, () => tool.stream(toolContext))
+          let toolNext = await this._tracer.withSpanContext(toolSpan, () => toolGenerator.next())
+          while (!toolNext.done) {
+            yield new ToolStreamUpdateEvent({ agent: this, event: toolNext.value })
+            toolNext = await this._tracer.withSpanContext(toolSpan, () => toolGenerator.next())
+          }
+          const result = toolNext.value
 
           if (!result) {
             // Tool didn't return a result
@@ -627,6 +867,9 @@ export class Agent implements AgentData {
         }
       }
 
+      // End tool span
+      this._tracer.endToolCallSpan(toolSpan, { toolResult, ...(error && { error }) })
+
       // Single point for AfterToolCallEvent
       const afterToolCallEvent = new AfterToolCallEvent({
         agent: this,
@@ -646,19 +889,45 @@ export class Agent implements AgentData {
   }
 
   /**
-   * Appends a message to the conversation history, invokes MessageAddedEvent hook,
-   * and returns the event for yielding.
+   * Appends a message to the conversation history and returns the event for yielding.
    *
    * @param message - The message to append
-   * @returns MessageAddedEvent to be yielded (hook already invoked)
+   * @returns MessageAddedEvent to be yielded
    */
-  private async _appendMessage(message: Message): Promise<MessageAddedEvent> {
+  private _appendMessage(message: Message): MessageAddedEvent {
     this.messages.push(message)
-    const event = new MessageAddedEvent({ agent: this, message })
-    // Invoke hooks immediately for message tracking
-    await this.hooks.invokeCallbacks(event)
-    // Return event for yielding (stream will skip hook invocation for MessageAddedEvent)
-    return event
+    return new MessageAddedEvent({ agent: this, message })
+  }
+
+  /**
+   * Creates an empty Usage object with all counters set to zero.
+   *
+   * @returns A Usage object with zeroed counters
+   */
+  private static _createEmptyUsage(): Usage {
+    return {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    }
+  }
+
+  /**
+   * Accumulates token usage from a source into a target Usage object.
+   *
+   * @param target - The Usage object to accumulate into (mutated in place)
+   * @param source - The Usage object to accumulate from
+   */
+  private static _accumulateUsage(target: Usage, source: Usage): void {
+    target.inputTokens += source.inputTokens
+    target.outputTokens += source.outputTokens
+    target.totalTokens += source.totalTokens
+    if (source.cacheReadInputTokens !== undefined) {
+      target.cacheReadInputTokens = (target.cacheReadInputTokens ?? 0) + source.cacheReadInputTokens
+    }
+    if (source.cacheWriteInputTokens !== undefined) {
+      target.cacheWriteInputTokens = (target.cacheWriteInputTokens ?? 0) + source.cacheWriteInputTokens
+    }
   }
 }
 

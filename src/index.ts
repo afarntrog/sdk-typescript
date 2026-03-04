@@ -8,8 +8,8 @@
 // Agent class
 export { Agent } from './agent/agent.js'
 
-// Agent state type (not constructor - internal implementation)
-export type { AgentState } from './agent/state.js'
+// App state
+export { AppState } from './app-state.js'
 
 // Agent types
 export type { AgentData } from './types/agent.js'
@@ -132,6 +132,7 @@ export type {
   ModelMetadataEvent,
   ModelStreamEvent,
 } from './models/streaming.js'
+export { isModelStreamEvent } from './models/streaming.js'
 
 // Model provider types
 export type { BaseModelConfig, StreamOptions } from './models/model.js'
@@ -148,7 +149,8 @@ export type { AgentStreamEvent } from './types/agent.js'
 // Hooks system
 export {
   HookRegistry,
-  HookEvent,
+  StreamEvent,
+  HookableEvent,
   InitializedEvent,
   BeforeInvocationEvent,
   AfterInvocationEvent,
@@ -159,9 +161,14 @@ export {
   AfterModelCallEvent,
   BeforeToolsEvent,
   AfterToolsEvent,
-  // ModelStreamEventHook # Disabled for now https://github.com/strands-agents/sdk-typescript/issues/288
+  ContentBlockEvent,
+  ModelMessageEvent,
+  ToolResultEvent,
+  ToolStreamUpdateEvent,
+  AgentResultEvent,
+  ModelStreamUpdateEvent,
 } from './hooks/index.js'
-export type { HookCallback, HookProvider, HookEventConstructor, ModelStopResponse } from './hooks/index.js'
+export type { HookCallback, HookProvider, HookableEventConstructor, ModelStopResponse } from './hooks/index.js'
 
 // Conversation Manager
 export { NullConversationManager } from './conversation-manager/null-conversation-manager.js'
@@ -176,3 +183,9 @@ export type { Logger } from './logging/types.js'
 
 // MCP Client types and implementations
 export { type McpClientConfig, McpClient } from './mcp.js'
+
+// Structured output
+export { StructuredOutputException } from './structured-output/exceptions.js'
+
+// Telemetry
+export * as telemetry from './telemetry/index.js'

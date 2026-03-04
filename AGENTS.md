@@ -19,16 +19,15 @@ sdk-typescript/
 ├── src/                          # Source code (all production code)
 │   ├── __tests__/                # Unit tests for root-level source files
 │   │   ├── errors.test.ts        # Tests for error classes
-│   │   └── index.test.ts         # Tests for main entry point
+│   │   ├── index.test.ts         # Tests for main entry point
+│   │   └── app-state.test.ts     # Tests for app state
 │   │
 │   ├── agent/                    # Agent loop and streaming
 │   │   ├── __tests__/            # Unit tests for agent loop
 │   │   │   ├── agent.test.ts     # Tests for agent implementation
-│   │   │   ├── state.test.ts     # Tests for agent state
 │   │   │   └── printer.test.ts   # Tests for printer
 │   │   ├── agent.ts              # Core agent implementation
 │   │   ├── printer.ts            # Agent output printing
-│   │   ├── state.ts              # Agent state implementation
 │   │   └── streaming.ts          # Agent streaming event types
 │   │
 │   ├── conversation-manager/ # Conversation management implementations
@@ -57,6 +56,12 @@ sdk-typescript/
 │   │   ├── model.ts              # Base model provider interface
 │   │   └── streaming.ts          # Streaming event types
 │   │
+│   ├── structured-output/        # Structured output with Zod schemas
+│   │   ├── exceptions.ts         # StructuredOutputException
+│   │   ├── utils.ts              # Zod to JSON Schema conversion
+│   │   ├── tool.ts               # Tool implementation for validation
+│   │   └── context.ts            # Per-invocation context management
+│   │
 │   ├── tools/                    # Tool definitions and types
 │   │   ├── __tests__/            # Unit tests for tools
 │   │   │   ├── registry.test.ts  # Tests for ToolRegistry
@@ -78,6 +83,7 @@ sdk-typescript/
 │   │
 │   ├── mcp.ts                    # MCP client implementation
 │   ├── errors.ts                 # Custom error classes
+│   ├── app-state.ts              # App state implementation
 │   └── index.ts                  # Main SDK entry point (single export point)
 │
 ├── vended_tools/                  # Optional vended tools (not part of core SDK)
@@ -137,6 +143,7 @@ sdk-typescript/
 - **`src/agent/conversation-manager/`**: Conversation history management strategies
 - **`src/hooks/`**: Hooks system for event-driven extensibility
 - **`src/models/`**: Model provider implementations (Bedrock, OpenAI, future providers)
+- **`src/structured-output/`**: Structured output with Zod schema validation and automatic retry logic
 - **`src/tools/`**: Tool definitions and types for agent tool use
 - **`src/types/`**: Core type definitions used across the SDK
 - **`vended_tools/`**: Optional vended tools (not part of core SDK, independently importable)
