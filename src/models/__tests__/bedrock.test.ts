@@ -6,6 +6,8 @@ import { ContextWindowOverflowError, ModelThrottledError } from '../../errors.js
 import { Message, ReasoningBlock, ToolUseBlock, ToolResultBlock, JsonBlock } from '../../types/messages.js'
 import type { SystemContentBlock } from '../../types/messages.js'
 import { TextBlock, GuardContentBlock, CachePointBlock } from '../../types/messages.js'
+import { ImageBlock, VideoBlock, DocumentBlock } from '../../types/media.js'
+import { CitationsBlock } from '../../types/citations.js'
 import type { StreamOptions } from '../model.js'
 import { collectIterator } from '../../__fixtures__/model-test-helpers.js'
 
@@ -253,7 +255,7 @@ describe('BedrockModel', () => {
       const provider = new BedrockModel({ region: 'us-east-1', apiKey: 'br-test-key', temperature: 0.5 })
       const config = provider.getConfig()
       expect(config).toStrictEqual({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         temperature: 0.5,
       })
     })
@@ -264,7 +266,7 @@ describe('BedrockModel', () => {
       const provider = new BedrockModel({ region: 'us-west-2', temperature: 0.5 })
       provider.updateConfig({ temperature: 0.8, maxTokens: 2048 })
       expect(provider.getConfig()).toStrictEqual({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         temperature: 0.8,
         maxTokens: 2048,
       })
@@ -307,13 +309,12 @@ describe('BedrockModel', () => {
     it('formats the request to bedrock properly', async () => {
       const provider = new BedrockModel({
         region: 'us-west-2',
-        modelId: 'test-model',
+        modelId: 'anthropic.claude-test-model',
         maxTokens: 1024,
         temperature: 0.7,
         topP: 0.9,
         stopSequences: ['STOP'],
-        cachePrompt: 'default',
-        cacheTools: 'default',
+        cacheConfig: { strategy: 'auto' },
         additionalResponseFieldPaths: ['Hello!'],
         additionalRequestFields: ['World!'],
         additionalArgs: {
@@ -343,14 +344,14 @@ describe('BedrockModel', () => {
         MyExtraArg: 'ExtraArg',
         additionalModelRequestFields: ['World!'],
         additionalModelResponseFieldPaths: ['Hello!'],
-        modelId: 'test-model',
+        modelId: 'anthropic.claude-test-model',
         messages: [
           {
             role: 'user',
-            content: [{ text: 'Hello' }],
+            content: [{ text: 'Hello' }, { cachePoint: { type: 'default' } }],
           },
         ],
-        system: [{ text: 'You are a helpful assistant' }, { cachePoint: { type: 'default' } }],
+        system: [{ text: 'You are a helpful assistant' }],
         toolConfig: {
           toolChoice: { auto: {} },
           tools: [
@@ -761,6 +762,80 @@ describe('BedrockModel', () => {
       })
     })
 
+    it('yields and validates citationsContent events correctly', async () => {
+      // Bedrock wire format uses object-key discrimination
+      const bedrockCitationsData = {
+        citations: [
+          {
+            location: { documentChar: { documentIndex: 0, start: 10, end: 50 } },
+            sourceContent: [{ text: 'source text' }],
+            source: 'doc-0',
+            title: 'Test Doc',
+          },
+        ],
+        content: [{ text: 'generated text' }],
+      }
+
+      const mockSend = vi.fn(async () => {
+        if (stream) {
+          return {
+            stream: (async function* (): AsyncGenerator<unknown> {
+              yield { messageStart: { role: 'assistant' } }
+              yield { contentBlockStart: {} }
+              yield {
+                contentBlockDelta: {
+                  delta: { citationsContent: bedrockCitationsData },
+                },
+              }
+              yield { contentBlockStop: {} }
+              yield { messageStop: { stopReason: 'end_turn' } }
+              yield {
+                metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }, metrics: { latencyMs: 100 } },
+              }
+            })(),
+          }
+        } else {
+          return {
+            output: {
+              message: {
+                role: 'assistant',
+                content: [{ citationsContent: bedrockCitationsData }],
+              },
+            },
+            stopReason: 'end_turn',
+            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+            metrics: { latencyMs: 100 },
+          }
+        }
+      })
+      mockBedrockClientImplementation({ send: mockSend })
+
+      const provider = new BedrockModel({ stream })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Cite this.')] })]
+      const events = await collectIterator(provider.stream(messages))
+
+      // SDK events should use type-field discrimination
+      expect(events).toContainEqual({ role: 'assistant', type: 'modelMessageStartEvent' })
+      expect(events).toContainEqual({ type: 'modelContentBlockStartEvent' })
+      expect(events).toContainEqual({
+        type: 'modelContentBlockDeltaEvent',
+        delta: {
+          type: 'citationsDelta',
+          citations: [
+            {
+              location: { type: 'documentChar', documentIndex: 0, start: 10, end: 50 },
+              sourceContent: [{ text: 'source text' }],
+              source: 'doc-0',
+              title: 'Test Doc',
+            },
+          ],
+          content: [{ text: 'generated text' }],
+        },
+      })
+      expect(events).toContainEqual({ type: 'modelContentBlockStopEvent' })
+      expect(events).toContainEqual({ stopReason: 'endTurn', type: 'modelMessageStopEvent' })
+    })
+
     describe('error handling', async () => {
       it.each([
         {
@@ -1100,8 +1175,8 @@ describe('BedrockModel', () => {
       vi.clearAllMocks()
     })
 
-    it('formats string system prompt with cachePrompt config', async () => {
-      const provider = new BedrockModel({ cachePrompt: 'default' })
+    it('does not add cache points to string system prompt with cacheConfig', async () => {
+      const provider = new BedrockModel({ cacheConfig: { strategy: 'auto' } })
       const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
       const options: StreamOptions = {
         systemPrompt: 'You are a helpful assistant',
@@ -1110,14 +1185,14 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
-            content: [{ text: 'Hello' }],
+            content: [{ text: 'Hello' }, { cachePoint: { type: 'default' } }],
           },
         ],
-        system: [{ text: 'You are a helpful assistant' }, { cachePoint: { type: 'default' } }],
+        system: [{ text: 'You are a helpful assistant' }],
       })
     })
 
@@ -1134,7 +1209,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1159,7 +1234,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1174,9 +1249,9 @@ describe('BedrockModel', () => {
       })
     })
 
-    it('warns when both array system prompt and cachePrompt config are provided', async () => {
+    it('does not warn when array system prompt is provided without cacheConfig', async () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-      const provider = new BedrockModel({ cachePrompt: 'default' })
+      const provider = new BedrockModel()
       const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
       const options: StreamOptions = {
         systemPrompt: [
@@ -1187,14 +1262,12 @@ describe('BedrockModel', () => {
 
       collectIterator(provider.stream(messages, options))
 
-      // Verify warning was logged
-      expect(warnSpy).toHaveBeenCalledWith(
-        'cachePrompt config is ignored when systemPrompt is an array, use explicit cache points instead'
-      )
+      // Verify no warning was logged
+      expect(warnSpy).not.toHaveBeenCalled()
 
-      // Verify array is used as-is (cachePrompt config ignored)
+      // Verify array is used as-is
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1205,6 +1278,149 @@ describe('BedrockModel', () => {
       })
 
       warnSpy.mockRestore()
+    })
+
+    it('adds cache point after tools when cacheConfig enabled', async () => {
+      const provider = new BedrockModel({ cacheConfig: { strategy: 'auto' } })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+      const options: StreamOptions = {
+        toolSpecs: [
+          {
+            name: 'calculator',
+            description: 'Calculate',
+            inputSchema: { type: 'object' },
+          },
+        ],
+      }
+
+      collectIterator(provider.stream(messages, options))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
+        modelId: 'global.anthropic.claude-sonnet-4-6',
+        messages: [
+          {
+            role: 'user',
+            content: [{ text: 'Hello' }, { cachePoint: { type: 'default' } }],
+          },
+        ],
+        toolConfig: {
+          tools: [
+            {
+              toolSpec: {
+                name: 'calculator',
+                description: 'Calculate',
+                inputSchema: { json: { type: 'object' } },
+              },
+            },
+            { cachePoint: { type: 'default' } },
+          ],
+        },
+      })
+    })
+
+    it('adds cache points to tools and messages when cacheConfig enabled', async () => {
+      const provider = new BedrockModel({ cacheConfig: { strategy: 'auto' } })
+      const messages = [
+        new Message({ role: 'user', content: [new TextBlock('Hello')] }),
+        new Message({ role: 'assistant', content: [new TextBlock('Hi')] }),
+      ]
+      const options: StreamOptions = {
+        systemPrompt: 'You are a helpful assistant',
+        toolSpecs: [
+          {
+            name: 'calculator',
+            description: 'Calculate',
+            inputSchema: { type: 'object' },
+          },
+        ],
+      }
+
+      collectIterator(provider.stream(messages, options))
+
+      const call = mockConverseStreamCommand.mock.lastCall?.[0]
+      expect(call?.system).toStrictEqual([{ text: 'You are a helpful assistant' }])
+      expect(call?.toolConfig?.tools).toStrictEqual([
+        {
+          toolSpec: {
+            name: 'calculator',
+            description: 'Calculate',
+            inputSchema: { json: { type: 'object' } },
+          },
+        },
+        { cachePoint: { type: 'default' } },
+      ])
+      const userMsg = call?.messages?.[0]
+      const lastBlock = userMsg?.content?.[userMsg.content.length - 1]
+      expect(lastBlock).toStrictEqual({ cachePoint: { type: 'default' } })
+      const assistantMsg = call?.messages?.[1]
+      const assistantLastBlock = assistantMsg?.content?.[assistantMsg.content.length - 1]
+      expect(assistantLastBlock).not.toStrictEqual({ cachePoint: { type: 'default' } })
+    })
+
+    it('does not mutate the original messages array', async () => {
+      const provider = new BedrockModel({ cacheConfig: { strategy: 'auto' } })
+      const originalMessages = [
+        new Message({ role: 'user', content: [new TextBlock('Hello')] }),
+        new Message({ role: 'assistant', content: [new TextBlock('Hi')] }),
+      ]
+
+      // Create a deep copy to compare against
+      const messagesCopy = JSON.parse(JSON.stringify(originalMessages))
+
+      collectIterator(provider.stream(originalMessages))
+
+      // Verify original messages are unchanged
+      expect(JSON.stringify(originalMessages)).toBe(JSON.stringify(messagesCopy))
+    })
+
+    it('logs warning and disables caching for non-caching models', async () => {
+      const warnSpy = vi.spyOn(console, 'warn')
+      const provider = new BedrockModel({
+        modelId: 'amazon.titan-text-express-v1',
+        cacheConfig: { strategy: 'auto' },
+      })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+      const options: StreamOptions = {
+        systemPrompt: 'You are a helpful assistant',
+      }
+
+      collectIterator(provider.stream(messages, options))
+
+      // Verify warning was logged
+      expect(warnSpy).toHaveBeenCalled()
+
+      // Verify no cache points were added
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
+        modelId: 'amazon.titan-text-express-v1',
+        messages: [
+          {
+            role: 'user',
+            content: [{ text: 'Hello' }],
+          },
+        ],
+        system: [{ text: 'You are a helpful assistant' }],
+      })
+
+      warnSpy.mockRestore()
+    })
+
+    it('enables caching with anthropic strategy for application inference profiles', async () => {
+      const provider = new BedrockModel({
+        modelId: 'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123',
+        cacheConfig: { strategy: 'anthropic' },
+      })
+      const messages = [
+        new Message({ role: 'user', content: [new TextBlock('Hello')] }),
+        new Message({ role: 'assistant', content: [new TextBlock('Hi')] }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      const call = mockConverseStreamCommand.mock.lastCall?.[0]
+      // Cache point should be on the user message (index 0)
+      const userMsg = call?.messages?.[0]
+      const lastBlock = userMsg?.content?.[userMsg.content.length - 1]
+      expect(lastBlock).toStrictEqual({ cachePoint: { type: 'default' } })
     })
 
     it('handles empty array system prompt', async () => {
@@ -1218,7 +1434,7 @@ describe('BedrockModel', () => {
 
       // Empty array should not set system field
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1246,7 +1462,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1287,7 +1503,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1327,7 +1543,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1365,7 +1581,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages, options))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1413,7 +1629,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1454,7 +1670,7 @@ describe('BedrockModel', () => {
       collectIterator(provider.stream(messages))
 
       expect(mockConverseStreamCommand).toHaveBeenLastCalledWith({
-        modelId: 'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        modelId: 'global.anthropic.claude-sonnet-4-6',
         messages: [
           {
             role: 'user',
@@ -1472,6 +1688,660 @@ describe('BedrockModel', () => {
           },
         ],
       })
+    })
+  })
+
+  describe('media blocks in tool results', () => {
+    const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+    it('formats image block in tool result', async () => {
+      const provider = new BedrockModel()
+      const imageBytes = new Uint8Array([1, 2, 3])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new ImageBlock({ format: 'png', source: { bytes: imageBytes } })],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [{ image: { format: 'png', source: { bytes: imageBytes } } }],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats video block in tool result with 3gp format mapping', async () => {
+      const provider = new BedrockModel()
+      const videoBytes = new Uint8Array([4, 5, 6])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new VideoBlock({ format: '3gp', source: { bytes: videoBytes } })],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [{ video: { format: 'three_gp', source: { bytes: videoBytes } } }],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats document block in tool result', async () => {
+      const provider = new BedrockModel()
+      const docBytes = new Uint8Array([7, 8, 9])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new DocumentBlock({ name: 'report.pdf', format: 'pdf', source: { bytes: docBytes } })],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [{ document: { name: 'report.pdf', format: 'pdf', source: { bytes: docBytes } } }],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats mixed text and media content in tool result', async () => {
+      const provider = new BedrockModel()
+      const imageBytes = new Uint8Array([1, 2])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [
+                new TextBlock('Here is the image:'),
+                new ImageBlock({ format: 'jpeg', source: { bytes: imageBytes } }),
+              ],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [
+                      { text: 'Here is the image:' },
+                      { image: { format: 'jpeg', source: { bytes: imageBytes } } },
+                    ],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+  })
+
+  describe('media blocks in messages', () => {
+    const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+    it('formats top-level image block', async () => {
+      const provider = new BedrockModel()
+      const imageBytes = new Uint8Array([1, 2, 3])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [new ImageBlock({ format: 'png', source: { bytes: imageBytes } })],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [{ image: { format: 'png', source: { bytes: imageBytes } } }],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats top-level image block with S3 source', async () => {
+      const provider = new BedrockModel()
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ImageBlock({ format: 'png', source: { location: { type: 's3', uri: 's3://bucket/image.png' } } }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [{ image: { format: 'png', source: { s3Location: { uri: 's3://bucket/image.png' } } } }],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats top-level video block with 3gp format mapping', async () => {
+      const provider = new BedrockModel()
+      const videoBytes = new Uint8Array([4, 5, 6])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [new VideoBlock({ format: '3gp', source: { bytes: videoBytes } })],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [{ video: { format: 'three_gp', source: { bytes: videoBytes } } }],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats top-level document block with text source converted to bytes', async () => {
+      const provider = new BedrockModel()
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [new DocumentBlock({ name: 'notes.txt', format: 'txt', source: { text: 'Hello world' } })],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  document: {
+                    name: 'notes.txt',
+                    format: 'txt',
+                    source: { bytes: new TextEncoder().encode('Hello world') },
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+  })
+
+  describe('citations content block formatting', () => {
+    const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+    it('maps SDK CitationLocation types to Bedrock object-key format through formatting pipeline', async () => {
+      const provider = new BedrockModel()
+      const sdkCitations = [
+        {
+          location: { type: 'documentChar' as const, documentIndex: 0, start: 150, end: 300 },
+          source: 'doc-0',
+          sourceContent: [{ text: 'char source' }],
+          title: 'Text Document',
+        },
+        {
+          location: { type: 'documentPage' as const, documentIndex: 0, start: 2, end: 3 },
+          source: 'doc-0',
+          sourceContent: [{ text: 'page source' }],
+          title: 'PDF Document',
+        },
+        {
+          location: { type: 'documentChunk' as const, documentIndex: 1, start: 5, end: 8 },
+          source: 'doc-1',
+          sourceContent: [{ text: 'chunk source' }],
+          title: 'Chunked Document',
+        },
+        {
+          location: { type: 'searchResult' as const, searchResultIndex: 0, start: 25, end: 150 },
+          source: 'search-0',
+          sourceContent: [{ text: 'search source' }],
+          title: 'Search Result',
+        },
+        {
+          location: { type: 'web' as const, url: 'https://example.com/doc', domain: 'example.com' },
+          source: 'web-0',
+          sourceContent: [{ text: 'web source' }],
+          title: 'Web Page',
+        },
+      ]
+
+      const messages = [
+        new Message({
+          role: 'assistant',
+          content: [
+            new CitationsBlock({
+              citations: sdkCitations,
+              content: [{ text: 'generated text with all citation types' }],
+            }),
+          ],
+        }),
+        new Message({
+          role: 'user',
+          content: [new TextBlock('Follow up')],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      // Bedrock wire format uses object-key discrimination
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                {
+                  citationsContent: {
+                    citations: [
+                      {
+                        location: { documentChar: { documentIndex: 0, start: 150, end: 300 } },
+                        source: 'doc-0',
+                        sourceContent: [{ text: 'char source' }],
+                        title: 'Text Document',
+                      },
+                      {
+                        location: { documentPage: { documentIndex: 0, start: 2, end: 3 } },
+                        source: 'doc-0',
+                        sourceContent: [{ text: 'page source' }],
+                        title: 'PDF Document',
+                      },
+                      {
+                        location: { documentChunk: { documentIndex: 1, start: 5, end: 8 } },
+                        source: 'doc-1',
+                        sourceContent: [{ text: 'chunk source' }],
+                        title: 'Chunked Document',
+                      },
+                      {
+                        location: {
+                          searchResultLocation: { searchResultIndex: 0, start: 25, end: 150 },
+                        },
+                        source: 'search-0',
+                        sourceContent: [{ text: 'search source' }],
+                        title: 'Search Result',
+                      },
+                      {
+                        location: { web: { url: 'https://example.com/doc', domain: 'example.com' } },
+                        source: 'web-0',
+                        sourceContent: [{ text: 'web source' }],
+                        title: 'Web Page',
+                      },
+                    ],
+                    content: [{ text: 'generated text with all citation types' }],
+                  },
+                },
+              ],
+            },
+            {
+              role: 'user',
+              content: [{ text: 'Follow up' }],
+            },
+          ],
+        })
+      )
+    })
+  })
+
+  describe('media blocks in tool results', () => {
+    const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+    it('formats image block in tool result', async () => {
+      const provider = new BedrockModel()
+      const imageBytes = new Uint8Array([1, 2, 3])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new ImageBlock({ format: 'png', source: { bytes: imageBytes } })],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [{ image: { format: 'png', source: { bytes: imageBytes } } }],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats video block in tool result with 3gp format mapping', async () => {
+      const provider = new BedrockModel()
+      const videoBytes = new Uint8Array([4, 5, 6])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new VideoBlock({ format: '3gp', source: { bytes: videoBytes } })],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [{ video: { format: 'three_gp', source: { bytes: videoBytes } } }],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats document block in tool result', async () => {
+      const provider = new BedrockModel()
+      const docBytes = new Uint8Array([7, 8, 9])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new DocumentBlock({ name: 'report.pdf', format: 'pdf', source: { bytes: docBytes } })],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [{ document: { name: 'report.pdf', format: 'pdf', source: { bytes: docBytes } } }],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats mixed text and media content in tool result', async () => {
+      const provider = new BedrockModel()
+      const imageBytes = new Uint8Array([1, 2])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [
+                new TextBlock('Here is the image:'),
+                new ImageBlock({ format: 'jpeg', source: { bytes: imageBytes } }),
+              ],
+            }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  toolResult: {
+                    toolUseId: 'tool-1',
+                    content: [
+                      { text: 'Here is the image:' },
+                      { image: { format: 'jpeg', source: { bytes: imageBytes } } },
+                    ],
+                    status: 'success',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
+    })
+  })
+
+  describe('media blocks in messages', () => {
+    const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+    it('formats top-level image block', async () => {
+      const provider = new BedrockModel()
+      const imageBytes = new Uint8Array([1, 2, 3])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [new ImageBlock({ format: 'png', source: { bytes: imageBytes } })],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [{ image: { format: 'png', source: { bytes: imageBytes } } }],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats top-level image block with S3 source', async () => {
+      const provider = new BedrockModel()
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ImageBlock({ format: 'png', source: { location: { type: 's3', uri: 's3://bucket/image.png' } } }),
+          ],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [{ image: { format: 'png', source: { s3Location: { uri: 's3://bucket/image.png' } } } }],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats top-level video block with 3gp format mapping', async () => {
+      const provider = new BedrockModel()
+      const videoBytes = new Uint8Array([4, 5, 6])
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [new VideoBlock({ format: '3gp', source: { bytes: videoBytes } })],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [{ video: { format: 'three_gp', source: { bytes: videoBytes } } }],
+            },
+          ],
+        })
+      )
+    })
+
+    it('formats top-level document block with text source converted to bytes', async () => {
+      const provider = new BedrockModel()
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [new DocumentBlock({ name: 'notes.txt', format: 'txt', source: { text: 'Hello world' } })],
+        }),
+      ]
+
+      collectIterator(provider.stream(messages))
+
+      expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  document: {
+                    name: 'notes.txt',
+                    format: 'txt',
+                    source: { bytes: new TextEncoder().encode('Hello world') },
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      )
     })
   })
 
@@ -1680,6 +2550,1332 @@ describe('BedrockModel', () => {
 
       // Should rethrow the error
       await expect(provider['_client'].config.region()).rejects.toThrow('Network error')
+    })
+  })
+
+  describe('guardrail configuration', () => {
+    const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+    beforeEach(() => {
+      vi.clearAllMocks()
+    })
+
+    describe('constructor', () => {
+      it('accepts guardrailConfig in options', () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+          },
+        })
+        expect(provider.getConfig().guardrailConfig).toStrictEqual({
+          guardrailIdentifier: 'my-guardrail-id',
+          guardrailVersion: '1',
+        })
+      })
+
+      it('accepts guardrailConfig with all options', () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            trace: 'enabled_full',
+            streamProcessingMode: 'sync',
+            redaction: {
+              input: true,
+              inputMessage: '[Custom input redacted.]',
+              output: true,
+              outputMessage: '[Custom output redacted.]',
+            },
+          },
+        })
+        expect(provider.getConfig().guardrailConfig).toStrictEqual({
+          guardrailIdentifier: 'my-guardrail-id',
+          guardrailVersion: '1',
+          trace: 'enabled_full',
+          streamProcessingMode: 'sync',
+          redaction: {
+            input: true,
+            inputMessage: '[Custom input redacted.]',
+            output: true,
+            outputMessage: '[Custom output redacted.]',
+          },
+        })
+      })
+    })
+
+    describe('request formatting', () => {
+      it('includes guardrailConfig in request with default trace', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            guardrailConfig: {
+              guardrailIdentifier: 'my-guardrail-id',
+              guardrailVersion: '1',
+              trace: 'enabled',
+            },
+          })
+        )
+      })
+
+      it('includes guardrailConfig in request with custom trace', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            trace: 'disabled',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            guardrailConfig: {
+              guardrailIdentifier: 'my-guardrail-id',
+              guardrailVersion: '1',
+              trace: 'disabled',
+            },
+          })
+        )
+      })
+
+      it('includes streamProcessingMode when specified', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            streamProcessingMode: 'sync',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            guardrailConfig: {
+              guardrailIdentifier: 'my-guardrail-id',
+              guardrailVersion: '1',
+              trace: 'enabled',
+              streamProcessingMode: 'sync',
+            },
+          })
+        )
+      })
+
+      it('does not include guardrailConfig when not configured', async () => {
+        const provider = new BedrockModel()
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.not.objectContaining({
+            guardrailConfig: expect.anything(),
+          })
+        )
+      })
+    })
+
+    describe('blocked guardrail detection', () => {
+      it('detects blocked guardrail in inputAssessment', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { contentBlockStart: {} }
+          yield { contentBlockDelta: { delta: { text: 'Hello' } } }
+          yield { contentBlockStop: {} }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: {
+                    '1234': {
+                      topicPolicy: {
+                        topics: [{ name: 'Harmful', action: 'BLOCKED', detected: true }],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+        const events = await collectIterator(provider.stream(messages))
+
+        const redactEvent = events.find((e) => e.type === 'modelRedactionEvent')
+        expect(redactEvent).toBeDefined()
+        expect(redactEvent).toStrictEqual({
+          type: 'modelRedactionEvent',
+          inputRedaction: { replaceContent: '[User input redacted.]' },
+        })
+      })
+
+      it('detects blocked guardrail in outputAssessments', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { contentBlockStart: {} }
+          yield { contentBlockDelta: { delta: { text: 'Hello' } } }
+          yield { contentBlockStop: {} }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  outputAssessments: {
+                    '1234': {
+                      contentPolicy: {
+                        filters: [{ type: 'VIOLENCE', action: 'BLOCKED', detected: true }],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+        const events = await collectIterator(provider.stream(messages))
+
+        const redactEvent = events.find((e) => e.type === 'modelRedactionEvent')
+        expect(redactEvent).toBeDefined()
+      })
+
+      it('does not emit redaction events when guardrail not blocked', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { contentBlockStart: {} }
+          yield { contentBlockDelta: { delta: { text: 'Hello' } } }
+          yield { contentBlockStop: {} }
+          yield { messageStop: { stopReason: 'end_turn' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: {
+                    '1234': {
+                      topicPolicy: {
+                        topics: [{ name: 'Safe', action: 'NONE', detected: false }],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+        const events = await collectIterator(provider.stream(messages))
+
+        const redactEvent = events.find((e) => e.type === 'modelRedactionEvent')
+        expect(redactEvent).toBeUndefined()
+      })
+
+      it('does not emit redaction events without guardrailConfig', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { contentBlockStart: {} }
+          yield { contentBlockDelta: { delta: { text: 'Hello' } } }
+          yield { contentBlockStop: {} }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: {
+                    '1234': {
+                      topicPolicy: {
+                        topics: [{ name: 'Harmful', action: 'BLOCKED', detected: true }],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel()
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello')] })]
+        const events = await collectIterator(provider.stream(messages))
+
+        const redactEvent = events.find((e) => e.type === 'modelRedactionEvent')
+        expect(redactEvent).toBeUndefined()
+      })
+    })
+
+    describe('redaction event generation', () => {
+      it('emits input redaction with default message', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          inputRedaction: { replaceContent: '[User input redacted.]' },
+        })
+      })
+
+      it('emits input redaction with custom message', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+            redaction: {
+              inputMessage: '[Custom input message]',
+            },
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          inputRedaction: { replaceContent: '[Custom input message]' },
+        })
+      })
+
+      it('does not emit input redaction when redactInput is false', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+            redaction: {
+              input: false,
+            },
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        const inputRedactEvent = events.find((e) => e.type === 'modelRedactionEvent' && 'inputRedaction' in e)
+        expect(inputRedactEvent).toBeUndefined()
+      })
+
+      it('emits output redaction when redactOutput is true', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+            redaction: {
+              output: true,
+            },
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          outputRedaction: { replaceContent: '[Assistant output redacted.]' },
+        })
+      })
+
+      it('emits output redaction with custom message', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+            redaction: {
+              output: true,
+              outputMessage: '[Custom output message]',
+            },
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          outputRedaction: { replaceContent: '[Custom output message]' },
+        })
+      })
+
+      it('emits both input and output redaction when both are enabled', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+            redaction: {
+              input: true,
+              output: true,
+            },
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          inputRedaction: { replaceContent: '[User input redacted.]' },
+        })
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          outputRedaction: { replaceContent: '[Assistant output redacted.]' },
+        })
+      })
+
+      it('includes redactedContent from modelOutput when available', async () => {
+        setupMockSend(async function* () {
+          yield { messageStart: { role: 'assistant' } }
+          yield { contentBlockStart: {} }
+          yield { contentBlockDelta: { delta: { text: 'This content was blocked' } } }
+          yield { contentBlockStop: {} }
+          yield { messageStop: { stopReason: 'guardrail_intervened' } }
+          yield {
+            metadata: {
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              trace: {
+                guardrail: {
+                  modelOutput: ['This content ', 'was blocked'],
+                  outputAssessments: {
+                    '0': [{ topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } }],
+                  },
+                },
+              },
+            },
+          }
+        })
+
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+            redaction: {
+              output: true,
+              outputMessage: '[Blocked]',
+            },
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          outputRedaction: {
+            replaceContent: '[Blocked]',
+            redactedContent: 'This content was blocked',
+          },
+        })
+      })
+    })
+
+    describe('non-streaming mode', () => {
+      it('emits redaction events in non-streaming mode when guardrail blocks', async () => {
+        const mockSend = vi.fn(async () => ({
+          output: {
+            message: {
+              role: 'assistant',
+              content: [{ text: 'Hello' }],
+            },
+          },
+          stopReason: 'guardrail_intervened',
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          trace: {
+            guardrail: {
+              inputAssessment: { '1': { topicPolicy: { topics: [{ action: 'BLOCKED', detected: true }] } } },
+            },
+          },
+        }))
+        mockBedrockClientImplementation({ send: mockSend })
+
+        const provider = new BedrockModel({
+          stream: false,
+          guardrailConfig: {
+            guardrailIdentifier: 'id',
+            guardrailVersion: '1',
+          },
+        })
+        const events = await collectIterator(
+          provider.stream([new Message({ role: 'user', content: [new TextBlock('Hello')] })])
+        )
+
+        expect(events).toContainEqual({
+          type: 'modelRedactionEvent',
+          inputRedaction: { replaceContent: '[User input redacted.]' },
+        })
+      })
+    })
+
+    describe('guardLatestUserMessage', () => {
+      const mockConverseStreamCommand = vi.mocked(ConverseStreamCommand)
+
+      beforeEach(() => {
+        vi.clearAllMocks()
+      })
+
+      it('accepts guardLatestUserMessage in guardrailConfig', () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        expect(provider.getConfig().guardrailConfig).toStrictEqual({
+          guardrailIdentifier: 'my-guardrail-id',
+          guardrailVersion: '1',
+          guardLatestUserMessage: true,
+        })
+      })
+
+      it('wraps latest user message text content in guardContent when enabled', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello world')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'Hello world',
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('wraps latest user message image content in guardContent when enabled', async () => {
+        const imageBytes = new Uint8Array([1, 2, 3, 4])
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new ImageBlock({
+                format: 'jpeg',
+                source: { bytes: imageBytes },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      image: {
+                        format: 'jpeg',
+                        source: { bytes: imageBytes },
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('does not wrap toolResult messages even though role is user', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({ role: 'user', content: [new TextBlock('What is 2+2?')] }),
+          new Message({
+            role: 'assistant',
+            content: [
+              new ToolUseBlock({
+                name: 'calculator',
+                toolUseId: 'tool-123',
+                input: { expression: '2+2' },
+              }),
+            ],
+          }),
+          new Message({
+            role: 'user',
+            content: [
+              new ToolResultBlock({
+                toolUseId: 'tool-123',
+                status: 'success',
+                content: [new TextBlock('4')],
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        // The latest message is a toolResult, but guardContent should wrap the FIRST user message
+        // which contains text, not the toolResult
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'What is 2+2?',
+                      },
+                    },
+                  },
+                ],
+              },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    toolUse: {
+                      name: 'calculator',
+                      toolUseId: 'tool-123',
+                      input: { expression: '2+2' },
+                    },
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    toolResult: expect.objectContaining({
+                      toolUseId: 'tool-123',
+                    }),
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('does not wrap messages when guardLatestUserMessage is false', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: false,
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello world')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [{ text: 'Hello world' }],
+              },
+            ],
+          })
+        )
+      })
+
+      it('does not wrap messages when guardLatestUserMessage is undefined', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+          },
+        })
+        const messages = [new Message({ role: 'user', content: [new TextBlock('Hello world')] })]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [{ text: 'Hello world' }],
+              },
+            ],
+          })
+        )
+      })
+
+      it('does not wrap assistant messages', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({ role: 'user', content: [new TextBlock('Hello')] }),
+          new Message({ role: 'assistant', content: [new TextBlock('Hi there!')] }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'Hello',
+                      },
+                    },
+                  },
+                ],
+              },
+              {
+                role: 'assistant',
+                content: [{ text: 'Hi there!' }],
+              },
+            ],
+          })
+        )
+      })
+
+      it('wraps only the last user text/image message in multi-turn conversation', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({ role: 'user', content: [new TextBlock('First message')] }),
+          new Message({ role: 'assistant', content: [new TextBlock('First response')] }),
+          new Message({ role: 'user', content: [new TextBlock('Second message')] }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [{ text: 'First message' }],
+              },
+              {
+                role: 'assistant',
+                content: [{ text: 'First response' }],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'Second message',
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('handles no user messages with text/image content gracefully', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        // Only assistant message, no user text/image content
+        const messages = [new Message({ role: 'assistant', content: [new TextBlock('Hello!')] })]
+
+        collectIterator(provider.stream(messages))
+
+        // Should not throw and should not wrap anything
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'assistant',
+                content: [{ text: 'Hello!' }],
+              },
+            ],
+          })
+        )
+      })
+
+      it('preserves explicit GuardContentBlock in messages without double-wrapping', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new GuardContentBlock({
+                text: {
+                  qualifiers: ['grounding_source'],
+                  text: 'Already guarded content',
+                },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        // Explicit GuardContentBlock should be preserved as-is (no text/image content to wrap)
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'Already guarded content',
+                        qualifiers: ['grounding_source'],
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('wraps all text and image blocks in the latest user message', async () => {
+        const imageBytes = new Uint8Array([5, 6, 7, 8])
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new TextBlock('Check this text'),
+              new ImageBlock({
+                format: 'png',
+                source: { bytes: imageBytes },
+              }),
+              new TextBlock('And this text too'),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'Check this text',
+                      },
+                    },
+                  },
+                  {
+                    guardContent: {
+                      image: {
+                        format: 'png',
+                        source: { bytes: imageBytes },
+                      },
+                    },
+                  },
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'And this text too',
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('skips wrapping images with unsupported formats (gif)', async () => {
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const imageBytes = new Uint8Array([1, 2, 3, 4])
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new ImageBlock({
+                format: 'gif',
+                source: { bytes: imageBytes },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(consoleWarnSpy).toHaveBeenCalledWith(
+          'image_format=<gif> | format not supported by bedrock guardrails | skipping guardContent wrap'
+        )
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    image: {
+                      format: 'gif',
+                      source: { bytes: imageBytes },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+        consoleWarnSpy.mockRestore()
+      })
+
+      it('skips wrapping images with unsupported formats (webp)', async () => {
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const imageBytes = new Uint8Array([1, 2, 3, 4])
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new ImageBlock({
+                format: 'webp',
+                source: { bytes: imageBytes },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(consoleWarnSpy).toHaveBeenCalledWith(
+          'image_format=<webp> | format not supported by bedrock guardrails | skipping guardContent wrap'
+        )
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    image: {
+                      format: 'webp',
+                      source: { bytes: imageBytes },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+        consoleWarnSpy.mockRestore()
+      })
+
+      it('skips wrapping images with S3 source', async () => {
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new ImageBlock({
+                format: 'png',
+                source: {
+                  location: {
+                    type: 's3',
+                    uri: 's3://bucket/image.png',
+                  },
+                },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(consoleWarnSpy).toHaveBeenCalledWith(
+          'source_type=<non-bytes> | image source must be bytes for bedrock guardrails | skipping guardContent wrap'
+        )
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    image: {
+                      format: 'png',
+                      source: {
+                        s3Location: {
+                          uri: 's3://bucket/image.png',
+                        },
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+        consoleWarnSpy.mockRestore()
+      })
+
+      it('skips wrapping images with URL source', async () => {
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new ImageBlock({
+                format: 'jpeg',
+                source: { url: 'https://example.com/image.jpg' },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        // URL sources return undefined in _formatMediaSource, resulting in source: undefined
+        expect(consoleWarnSpy).toHaveBeenCalledWith(
+          'source_type=<imageSourceUrl> | not supported by bedrock | skipping'
+        )
+        // The image block still appears but with undefined source (Bedrock will reject this)
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    image: {
+                      format: 'jpeg',
+                      source: undefined,
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+        consoleWarnSpy.mockRestore()
+      })
+
+      it('wraps supported image formats (png and jpeg) with bytes source', async () => {
+        const imageBytes = new Uint8Array([1, 2, 3, 4])
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new ImageBlock({
+                format: 'png',
+                source: { bytes: imageBytes },
+              }),
+              new ImageBlock({
+                format: 'jpeg',
+                source: { bytes: imageBytes },
+              }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      image: {
+                        format: 'png',
+                        source: { bytes: imageBytes },
+                      },
+                    },
+                  },
+                  {
+                    guardContent: {
+                      image: {
+                        format: 'jpeg',
+                        source: { bytes: imageBytes },
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          })
+        )
+      })
+
+      it('does not wrap reasoning or cachePoint blocks', async () => {
+        const provider = new BedrockModel({
+          guardrailConfig: {
+            guardrailIdentifier: 'my-guardrail-id',
+            guardrailVersion: '1',
+            guardLatestUserMessage: true,
+          },
+        })
+        const messages = [
+          new Message({
+            role: 'user',
+            content: [
+              new TextBlock('User message'),
+              new ReasoningBlock({ text: 'thinking...', signature: 'sig' }),
+              new CachePointBlock({ cacheType: 'default' }),
+            ],
+          }),
+        ]
+
+        collectIterator(provider.stream(messages))
+
+        expect(mockConverseStreamCommand).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    guardContent: {
+                      text: {
+                        text: 'User message',
+                      },
+                    },
+                  },
+                  {
+                    reasoningContent: {
+                      reasoningText: {
+                        text: 'thinking...',
+                        signature: 'sig',
+                      },
+                    },
+                  },
+                  { cachePoint: { type: 'default' } },
+                ],
+              },
+            ],
+          })
+        )
+      })
     })
   })
 })

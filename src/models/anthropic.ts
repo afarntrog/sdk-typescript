@@ -2,12 +2,13 @@ import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk'
 import { Model, type BaseModelConfig, type StreamOptions } from '../models/model.js'
 import type { Message, ContentBlock } from '../types/messages.js'
 import type { ModelStreamEvent } from '../models/streaming.js'
+import { createEmptyUsage } from '../models/streaming.js'
 import { ContextWindowOverflowError, ModelThrottledError, normalizeError } from '../errors.js'
 import type { ImageBlock, DocumentBlock } from '../types/media.js'
 import { encodeBase64 } from '../types/media.js'
 import { logger } from '../logging/logger.js'
 
-const DEFAULT_ANTHROPIC_MODEL_ID = 'claude-sonnet-4-5-20250929'
+const DEFAULT_ANTHROPIC_MODEL_ID = 'claude-sonnet-4-6'
 const CONTEXT_WINDOW_OVERFLOW_ERRORS = ['prompt is too long', 'max_tokens exceeded', 'input too long']
 const TEXT_FILE_FORMATS = ['txt', 'md', 'markdown', 'csv', 'json', 'xml', 'html', 'yml', 'yaml', 'js', 'ts', 'py']
 
@@ -73,13 +74,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
       const request = this._formatRequest(messages, options)
       const stream = this._client.messages.stream(request)
 
-      const usage: {
-        inputTokens: number
-        outputTokens: number
-        totalTokens: number
-        cacheWriteInputTokens?: number
-        cacheReadInputTokens?: number
-      } = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+      const usage = createEmptyUsage()
 
       let stopReason = 'endTurn'
 
@@ -247,7 +242,9 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
 
             if (cacheControl) i++
           } else if (block.type === 'guardContentBlock') {
-            logger.warn('guardContentBlock is not supported in Anthropic system prompt')
+            logger.warn(
+              'block_type=<guardContentBlock> | guard content not supported in anthropic system prompt | skipping'
+            )
           }
         }
         if (systemBlocks.length > 0) request.system = systemBlocks
@@ -362,7 +359,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
             },
           }
         }
-        logger.warn('Anthropic provider requires image bytes. URLs not fully supported.')
+        logger.warn('source_type=<imageSourceUrl> | anthropic requires image bytes | url sources not fully supported')
         return undefined
       }
 
@@ -389,7 +386,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
             if (typeof TextDecoder !== 'undefined') {
               textContent = new TextDecoder().decode(docBlock.source.bytes)
             } else {
-              logger.warn(`Cannot decode bytes for ${docBlock.format} document: TextDecoder missing.`)
+              logger.warn(`format=<${docBlock.format}> | cannot decode document bytes | TextDecoder not available`)
             }
           }
 
@@ -401,7 +398,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
           }
         }
 
-        logger.warn(`Unsupported document format or source for Anthropic: ${docBlock.format}`)
+        logger.warn(`format=<${docBlock.format}> | unsupported document format or source for anthropic`)
         return undefined
       }
 
@@ -413,22 +410,23 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
           input: block.input as Record<string, unknown>,
         }
 
+      case 'videoBlock':
+        logger.warn('block_type=<videoBlock> | video blocks not supported by anthropic, skipping')
+        return undefined
+
       case 'toolResultBlock': {
         const innerContent = block.content
           .map((c) => {
             if (c.type === 'textBlock') return { type: 'text' as const, text: c.text }
             if (c.type === 'jsonBlock') return { type: 'text' as const, text: JSON.stringify(c.json) }
 
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            if ((c as any).type === 'imageBlock') {
-              const img = this._formatContentBlock(c as unknown as ContentBlock)
-              if (img && img.type === 'image') return img
-            }
-            return undefined
+            // Recursively format any other content block (image, document, video, etc.)
+            const formatted = this._formatContentBlock(c as unknown as ContentBlock)
+            return formatted
           })
           .filter((c): c is NonNullable<typeof c> => !!c)
 
-        let contentVal: string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>
+        let contentVal: string | Anthropic.ContentBlockParam[]
 
         const firstItem = innerContent[0]
         if (innerContent.length === 1 && firstItem && firstItem.type === 'text') {
@@ -479,7 +477,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
       case 'tool_use':
         return 'toolUse'
       default:
-        logger.warn(`Unknown stop reason: ${anthropicReason}`)
+        logger.warn(`stop_reason=<${anthropicReason}> | unknown anthropic stop reason`)
         return anthropicReason
     }
   }

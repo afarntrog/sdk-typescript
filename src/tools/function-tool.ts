@@ -1,10 +1,18 @@
 import { createErrorResult, Tool } from './tool.js'
-import type { ToolContext } from './tool.js'
+import type { InvokableTool, ToolContext } from './tool.js'
 import { ToolStreamEvent } from './tool.js'
 import type { ToolSpec } from './types.js'
 import type { JSONSchema, JSONValue } from '../types/json.js'
 import { deepCopy } from '../types/json.js'
-import { JsonBlock, TextBlock, ToolResultBlock } from '../types/messages.js'
+import {
+  JsonBlock,
+  TextBlock,
+  ToolResultBlock,
+  toolResultContentFromData,
+  type ToolResultContent,
+  type ToolResultContentData,
+} from '../types/messages.js'
+import { DocumentBlock, ImageBlock, VideoBlock } from '../types/media.js'
 
 /**
  * Callback function for FunctionTool implementations.
@@ -88,7 +96,7 @@ export interface FunctionToolConfig {
  * })
  * ```
  */
-export class FunctionTool extends Tool {
+export class FunctionTool extends Tool implements InvokableTool<unknown, JSONValue> {
   /**
    * The unique name of the tool.
    */
@@ -202,15 +210,44 @@ export class FunctionTool extends Tool {
   }
 
   /**
+   * Invokes the tool directly with raw input and returns the unwrapped result.
+   *
+   * Unlike stream(), this method:
+   * - Returns the raw result (not wrapped in ToolResult)
+   * - Consumes async generators and returns the generator's return value
+   * - Lets errors throw naturally (not wrapped in error ToolResult)
+   *
+   * @param input - The input parameters for the tool
+   * @param context - Optional tool execution context
+   * @returns The unwrapped result
+   */
+  async invoke(input: unknown, context?: ToolContext): Promise<JSONValue> {
+    const result = this._callback(input, context as ToolContext)
+
+    if (result && typeof result === 'object' && Symbol.asyncIterator in result) {
+      const generator = result as AsyncGenerator<unknown, JSONValue, undefined>
+      let iterResult = await generator.next()
+      while (!iterResult.done) {
+        iterResult = await generator.next()
+      }
+      return iterResult.value
+    }
+
+    return (await result) as JSONValue
+  }
+
+  /**
    * Wraps a value in a ToolResultBlock with success status.
    *
    * Due to AWS Bedrock limitations (only accepts objects as JSON content), the following
    * rules are applied:
+   * - Content blocks (TextBlock, JsonBlock, ImageBlock, VideoBlock, DocumentBlock) → passed through directly
+   * - Arrays of content blocks → used directly as content array
    * - Strings → TextBlock
    * - Numbers, Booleans → TextBlock (converted to string)
    * - null, undefined → TextBlock (special string representation)
    * - Objects → JsonBlock (with deep copy)
-   * - Arrays → JsonBlock wrapped in \{ $value: array \} (with deep copy)
+   * - Arrays (non-content blocks) → JsonBlock wrapped in \{ $value: array \} (with deep copy)
    *
    * @param value - The value to wrap (can be any type)
    * @param toolUseId - The tool use ID for the ToolResultBlock
@@ -218,6 +255,15 @@ export class FunctionTool extends Tool {
    */
   private _wrapInToolResult(value: unknown, toolUseId: string): ToolResultBlock {
     try {
+      // Handle media blocks - pass through directly
+      if (value instanceof DocumentBlock || value instanceof ImageBlock || value instanceof VideoBlock) {
+        return new ToolResultBlock({
+          toolUseId,
+          status: 'success',
+          content: [value],
+        })
+      }
+
       // Handle null with special string representation as text content
       if (value === null) {
         return new ToolResultBlock({
@@ -236,6 +282,16 @@ export class FunctionTool extends Tool {
         })
       }
 
+      // Handle content blocks - class instances or plain data objects
+      const contentBlock = this._asToolResultContent(value)
+      if (contentBlock) {
+        return new ToolResultBlock({
+          toolUseId,
+          status: 'success',
+          content: [contentBlock],
+        })
+      }
+
       // Handle primitives (strings, numbers, booleans) as text content
       // Bedrock doesn't accept primitives as JSON content, so we convert all to strings
       if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
@@ -246,8 +302,21 @@ export class FunctionTool extends Tool {
         })
       }
 
-      // Handle arrays by wrapping in object { $value: array }
+      // Handle arrays
       if (Array.isArray(value)) {
+        // Check if array contains only content blocks (class instances or plain data objects)
+        if (value.length > 0) {
+          const converted = value.map((item) => this._asToolResultContent(item))
+          if (converted.every((item): item is ToolResultContent => item !== undefined)) {
+            return new ToolResultBlock({
+              toolUseId,
+              status: 'success',
+              content: converted,
+            })
+          }
+        }
+
+        // Otherwise wrap in object { $value: array }
         const copiedValue = deepCopy(value)
         return new ToolResultBlock({
           toolUseId,
@@ -266,6 +335,37 @@ export class FunctionTool extends Tool {
     } catch (error) {
       // If deep copy fails (circular references, non-serializable values), return error result
       return createErrorResult(error, toolUseId)
+    }
+  }
+
+  /**
+   * Converts a value to a ToolResultContent instance if it matches a known content type.
+   * Accepts both class instances and plain data objects.
+   *
+   * @param value - Value to check and convert
+   * @returns ToolResultContent instance, or undefined if not a recognized content type
+   */
+  private _asToolResultContent(value: unknown): ToolResultContent | undefined {
+    if (typeof value !== 'object') return undefined
+
+    // Class instances — pass through
+    if (
+      value instanceof TextBlock ||
+      value instanceof JsonBlock ||
+      value instanceof ImageBlock ||
+      value instanceof VideoBlock ||
+      value instanceof DocumentBlock
+    ) {
+      return value
+    }
+
+    // Plain data objects — require exactly one key to match the discriminated
+    // union shape; multi-key objects fall through to JsonBlock instead.
+    try {
+      if (Object.keys(value as object).length !== 1) return undefined
+      return toolResultContentFromData(value as ToolResultContentData)
+    } catch {
+      return undefined
     }
   }
 }

@@ -2,23 +2,24 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { bash } from '../index.js'
 import { BashTimeoutError, BashSessionError, type BashOutput } from '../index.js'
 import type { ToolContext } from '../../../index.js'
-import { AppState } from '../../../app-state.js'
+import { StateStore } from '../../../state-store.js'
+import { createMockAgent } from '../../../__fixtures__/agent-helpers.js'
 import { realpathSync } from 'fs'
 
 // Skip tests on Windows (bash not available)
 describe.skipIf(process.platform === 'win32')('bash tool', () => {
   // Helper to create fresh context
-  const createFreshContext = (): { state: AppState; context: ToolContext } => {
-    const state = new AppState({})
+  const createFreshContext = (): { state: StateStore; context: ToolContext } => {
+    const agent = createMockAgent()
     const context: ToolContext = {
       toolUse: {
         name: 'bash',
         toolUseId: 'test-id',
         input: {},
       },
-      agent: { state, messages: [] },
+      agent,
     }
-    return { state, context }
+    return { state: agent.appState, context }
   }
 
   afterEach(() => {
@@ -104,6 +105,24 @@ describe.skipIf(process.platform === 'win32')('bash tool', () => {
       // Verify the variable is gone after restart
       const result = await bash.invoke({ mode: 'execute', command: 'echo "${TEST_VAR:-empty}"' }, context)
       expect((result as BashOutput).output.trim()).toBe('empty')
+    })
+
+    it('persists environment variables between calls', async () => {
+      const { context } = createFreshContext()
+
+      await bash.invoke({ mode: 'execute', command: 'MY_VAR="persistent_value"' }, context)
+      const result = await bash.invoke({ mode: 'execute', command: 'echo $MY_VAR' }, context)
+
+      expect((result as BashOutput).output.trim()).toBe('persistent_value')
+    })
+
+    it('persists working directory between calls', async () => {
+      const { context } = createFreshContext()
+
+      await bash.invoke({ mode: 'execute', command: 'cd /tmp' }, context)
+      const result = await bash.invoke({ mode: 'execute', command: 'pwd' }, context)
+
+      expect(realpathSync((result as BashOutput).output.trim())).toBe(realpathSync('/tmp'))
     })
 
     it('provides isolated sessions for different agents', async () => {

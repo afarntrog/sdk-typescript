@@ -1,10 +1,11 @@
 import type { Role, StopReason } from '../types/messages.js'
 import type { JSONValue } from '../types/json.js'
+import type { Citation, CitationGeneratedContent } from '../types/citations.js'
 
 /**
  * ModelStreamEvent types for Model interactions.
  *
- * This module follows a pattern where <name>Data interfaces define the structure
+ * This module follows a pattern where "Data" interfaces define the structure
  * for objects, while corresponding classes extend those interfaces with additional
  * functionality and type discrimination.
  */
@@ -22,6 +23,7 @@ export type ModelStreamEvent =
   | ModelContentBlockStopEventData
   | ModelMessageStopEventData
   | ModelMetadataEventData
+  | ModelRedactionEventData
 
 /** Set of all ModelStreamEvent type discriminators. */
 const modelStreamEventTypes: ReadonlySet<string> = new Set<ModelStreamEvent['type']>([
@@ -31,6 +33,7 @@ const modelStreamEventTypes: ReadonlySet<string> = new Set<ModelStreamEvent['typ
   'modelContentBlockStopEvent',
   'modelMessageStopEvent',
   'modelMetadataEvent',
+  'modelRedactionEvent',
 ])
 
 /**
@@ -286,6 +289,85 @@ export class ModelMetadataEvent implements ModelMetadataEventData {
 }
 
 /**
+ * Information about input content redaction.
+ * Does not include redactedContent since the original input is already available
+ * in the messages array from BeforeModelCallEvent.
+ */
+export interface RedactInputContent {
+  /**
+   * The content to replace the redacted input with.
+   */
+  replaceContent: string
+}
+
+/**
+ * Information about output content redaction.
+ * May include the original content if captured during streaming.
+ */
+export interface RedactOutputContent {
+  /**
+   * The original content that was blocked by guardrails.
+   * May not be available for all providers.
+   */
+  redactedContent?: string
+
+  /**
+   * The content to replace the redacted output with.
+   */
+  replaceContent: string
+}
+
+/**
+ * Data for a redact event.
+ * Emitted when guardrails block content and redaction is enabled.
+ */
+export interface ModelRedactionEventData {
+  /**
+   * Discriminator for redact events.
+   */
+  type: 'modelRedactionEvent'
+
+  /**
+   * Input redaction information (when input is blocked).
+   */
+  inputRedaction?: RedactInputContent
+
+  /**
+   * Output redaction information (when output is blocked).
+   */
+  outputRedaction?: RedactOutputContent
+}
+
+/**
+ * Event emitted when guardrails block content and trigger redaction.
+ */
+export class ModelRedactionEvent implements ModelRedactionEventData {
+  /**
+   * Discriminator for redact events.
+   */
+  readonly type = 'modelRedactionEvent' as const
+
+  /**
+   * Input redaction information (when input is blocked).
+   */
+  readonly inputRedaction?: RedactInputContent
+
+  /**
+   * Output redaction information (when output is blocked).
+   */
+  readonly outputRedaction?: RedactOutputContent
+
+  constructor(data: ModelRedactionEventData) {
+    if (data.inputRedaction !== undefined) {
+      this.inputRedaction = data.inputRedaction
+    }
+    if (data.outputRedaction !== undefined) {
+      this.outputRedaction = data.outputRedaction
+    }
+  }
+}
+
+/**
  * Information about a content block that is starting.
  * Currently only represents tool use starts.
  */
@@ -323,7 +405,7 @@ export interface ToolUseStart {
  *
  * This is a discriminated union for type-safe delta handling.
  */
-export type ContentBlockDelta = TextDelta | ToolUseInputDelta | ReasoningContentDelta
+export type ContentBlockDelta = TextDelta | ToolUseInputDelta | ReasoningContentDelta | CitationsDelta
 
 /**
  * Text delta within a content block.
@@ -384,6 +466,27 @@ export interface ReasoningContentDelta {
 }
 
 /**
+ * Citations content delta within a content block.
+ * Represents a citations content block from the model.
+ */
+export interface CitationsDelta {
+  /**
+   * Discriminator for citations content delta.
+   */
+  type: 'citationsDelta'
+
+  /**
+   * Array of citations linking generated content to source locations.
+   */
+  citations: Citation[]
+
+  /**
+   * The generated content associated with these citations.
+   */
+  content: CitationGeneratedContent[]
+}
+
+/**
  * Token usage statistics for a model invocation.
  * Tracks input, output, and total tokens, plus cache-related metrics.
  */
@@ -424,4 +527,41 @@ export interface Metrics {
    * Latency in milliseconds.
    */
   latencyMs: number
+
+  /**
+   * Time to first byte in milliseconds.
+   * Latency from sending the model request to receiving the first content chunk.
+   */
+  timeToFirstByteMs?: number
+}
+
+/**
+ * Accumulates token usage from a source into a target, mutating the target in place.
+ *
+ * @param target - Usage object to accumulate into
+ * @param source - Usage object to add from
+ */
+export function accumulateUsage(target: Usage, source: Usage): void {
+  target.inputTokens += source.inputTokens
+  target.outputTokens += source.outputTokens
+  target.totalTokens += source.totalTokens
+  if (source.cacheReadInputTokens !== undefined) {
+    target.cacheReadInputTokens = (target.cacheReadInputTokens ?? 0) + source.cacheReadInputTokens
+  }
+  if (source.cacheWriteInputTokens !== undefined) {
+    target.cacheWriteInputTokens = (target.cacheWriteInputTokens ?? 0) + source.cacheWriteInputTokens
+  }
+}
+
+/**
+ * Creates a Usage object with all counters zeroed.
+ *
+ * @returns A Usage object with zeroed counters
+ */
+export function createEmptyUsage(): Usage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+  }
 }

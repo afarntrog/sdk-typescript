@@ -1,21 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { NodeTracerProvider, ConsoleSpanExporter } from '@opentelemetry/sdk-trace-node'
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
+import { ConsoleSpanExporter } from '@opentelemetry/sdk-trace-base'
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
+import { findMetricValue } from '../../__fixtures__/metrics-helpers.js'
 
-// Mock the exporters
 vi.mock('@opentelemetry/exporter-trace-otlp-http', () => ({
   OTLPTraceExporter: vi.fn(),
 }))
 
-vi.mock('@opentelemetry/sdk-trace-node', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@opentelemetry/sdk-trace-node')>()
+vi.mock('@opentelemetry/sdk-trace-base', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@opentelemetry/sdk-trace-base')>()
   return {
     ...actual,
     ConsoleSpanExporter: vi.fn(),
   }
 })
 
-describe('setupTracer', () => {
+// resetModules clears the module cache so each test gets a fresh singleton.
+// Tests use dynamic await import() to re-import after the reset.
+
+describe('setupTracer (node-specific)', () => {
   const originalEnv = { ...process.env }
 
   beforeEach(() => {
@@ -27,31 +31,16 @@ describe('setupTracer', () => {
     process.env = { ...originalEnv }
   })
 
-  describe('singleton behavior', () => {
-    it('should return the same provider instance when called twice', async () => {
+  describe('provider auto-detection', () => {
+    it('should use NodeTracerProvider by default for async context support', async () => {
       const telemetry = await import('../index.js')
 
-      const provider1 = telemetry.setupTracer({ exporters: { console: true } })
-      const provider2 = telemetry.setupTracer({ exporters: { otlp: true } })
+      const provider = telemetry.setupTracer()
 
-      expect(provider1).toBe(provider2)
+      expect(provider).toBeInstanceOf(NodeTracerProvider)
     })
 
-    it('should log a warning when called twice', async () => {
-      // Must dynamically import logger to get the same instance used by the fresh telemetry module
-      const { logger } = await import('../../logging/index.js')
-      const warnSpy = vi.spyOn(logger, 'warn')
-      const telemetry = await import('../index.js')
-
-      telemetry.setupTracer()
-      telemetry.setupTracer()
-
-      expect(warnSpy).toHaveBeenCalledWith('tracer provider already initialized, returning existing provider')
-    })
-  })
-
-  describe('custom provider', () => {
-    it('should use custom provider instead of creating a new one', async () => {
+    it('should accept a custom NodeTracerProvider', async () => {
       const telemetry = await import('../index.js')
       const customProvider = new NodeTracerProvider()
 
@@ -106,15 +95,7 @@ describe('setupTracer', () => {
     })
   })
 
-  describe('resource attributes', () => {
-    it('should use strands-agents as default service name', async () => {
-      const telemetry = await import('../index.js')
-
-      const provider = telemetry.setupTracer()
-
-      expect(provider.resource.attributes['service.name']).toBe('strands-agents')
-    })
-
+  describe('resource attributes from environment', () => {
     it('should use OTEL_SERVICE_NAME when set', async () => {
       process.env.OTEL_SERVICE_NAME = 'my-custom-service'
       const telemetry = await import('../index.js')
@@ -142,18 +123,6 @@ describe('setupTracer', () => {
       expect(provider.resource.attributes['deployment.environment']).toBe('production')
     })
 
-    it('should include default resource attributes', async () => {
-      const telemetry = await import('../index.js')
-
-      const provider = telemetry.setupTracer()
-
-      expect(provider.resource.attributes['service.name']).toBe('strands-agents')
-      expect(provider.resource.attributes['service.namespace']).toBe('strands')
-      expect(provider.resource.attributes['deployment.environment']).toBe('development')
-      expect(provider.resource.attributes['telemetry.sdk.name']).toBe('opentelemetry')
-      expect(provider.resource.attributes['telemetry.sdk.language']).toBe('typescript')
-    })
-
     it('should merge OTEL_RESOURCE_ATTRIBUTES with defaults', async () => {
       process.env.OTEL_RESOURCE_ATTRIBUTES = 'service.version=1.0.0,custom.team=platform'
       const telemetry = await import('../index.js')
@@ -173,6 +142,83 @@ describe('setupTracer', () => {
 
       expect(provider.resource.attributes['service.name']).toBe('custom-service')
       expect(provider.resource.attributes['deployment.environment']).toBe('production')
+    })
+  })
+})
+
+describe('setupMeter (node-specific)', () => {
+  const originalEnv = { ...process.env }
+
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    process.env = { ...originalEnv }
+  })
+
+  describe('resource attributes from environment', () => {
+    it('should use OTEL_SERVICE_NAME when set', async () => {
+      process.env.OTEL_SERVICE_NAME = 'my-meter-service'
+      const { InMemoryMetricExporter, PeriodicExportingMetricReader, AggregationTemporality } =
+        await import('@opentelemetry/sdk-metrics')
+      const telemetry = await import('../index.js')
+
+      const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE)
+      const provider = telemetry.setupMeter()
+      provider.addMetricReader(new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 100 }))
+
+      provider.getMeter('test').createCounter('probe').add(1)
+      await provider.forceFlush()
+
+      const resource = exporter.getMetrics().at(-1)?.resource
+      expect(resource?.attributes['service.name']).toBe('my-meter-service')
+
+      await provider.shutdown()
+    })
+  })
+
+  describe('global meter provider registration', () => {
+    it('returns a provider that produces real metrics via its own meter', async () => {
+      const {
+        MeterProvider: SdkMeterProvider,
+        InMemoryMetricExporter,
+        PeriodicExportingMetricReader,
+        AggregationTemporality,
+      } = await import('@opentelemetry/sdk-metrics')
+      const telemetry = await import('../index.js')
+
+      const testExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE)
+      const testReader = new PeriodicExportingMetricReader({
+        exporter: testExporter,
+        exportIntervalMillis: 100,
+      })
+      const testProvider = new SdkMeterProvider({ readers: [testReader] })
+
+      const provider = telemetry.setupMeter({ provider: testProvider })
+
+      const meter = provider.getMeter('test-registration')
+      const counter = meter.createCounter('test_registration_counter')
+      counter.add(42)
+
+      await testProvider.forceFlush()
+
+      expect(findMetricValue(testExporter.getMetrics(), 'test_registration_counter')).toBe(42)
+
+      await testProvider.shutdown()
+    })
+  })
+
+  describe('custom provider', () => {
+    it('accepts a custom MeterProvider', async () => {
+      const { MeterProvider } = await import('@opentelemetry/sdk-metrics')
+      const telemetry = await import('../index.js')
+      const customProvider = new MeterProvider()
+
+      const provider = telemetry.setupMeter({ provider: customProvider })
+
+      expect(provider).toBe(customProvider)
     })
   })
 })

@@ -6,6 +6,7 @@
  */
 
 import type { Message } from './types/messages.js'
+import type { JSONValue } from './types/json.js'
 
 /**
  * Base exception class for all model-related errors.
@@ -145,6 +146,14 @@ export function normalizeError(error: unknown): Error {
 }
 
 /**
+ * Serializes an Error to a JSON-compatible value.
+ * Use {@link normalizeError} for the reverse direction.
+ */
+export function serializeError(error: Error): JSONValue {
+  return error.message
+}
+
+/**
  * Error thrown when session operations fail.
  *
  * This error indicates failures in session storage operations such as
@@ -160,5 +169,27 @@ export class SessionError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
     this.name = 'SessionError'
+  }
+}
+
+/**
+ * Thrown when a tool fails validation during registration.
+ */
+export class ToolValidationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ToolValidationError'
+  }
+}
+
+/**
+ * Thrown when the model fails to produce structured output.
+ * This occurs when the LLM refuses to use the structured output tool
+ * even after being forced via toolChoice.
+ */
+export class StructuredOutputError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'StructuredOutputError'
   }
 }

@@ -8,6 +8,8 @@ import {
   TextBlock,
   ToolUseBlock,
 } from '../types/messages.js'
+import { CitationsBlock } from '../types/citations.js'
+import type { Citation, CitationGeneratedContent } from '../types/citations.js'
 import type { ToolChoice, ToolSpec } from '../tools/types.js'
 import {
   ModelContentBlockDeltaEvent,
@@ -16,9 +18,44 @@ import {
   ModelMessageStartEvent,
   ModelMessageStopEvent,
   ModelMetadataEvent,
+  ModelRedactionEvent,
   type ModelStreamEvent,
 } from './streaming.js'
 import { MaxTokensError, ModelError, normalizeError } from '../errors.js'
+import type { Redaction } from '../hooks/events.js'
+import { logger } from '../logging/logger.js'
+
+class CitationAccumulator {
+  citations: Citation[] = []
+  content: CitationGeneratedContent[] = []
+
+  push(citations: Citation[], content: CitationGeneratedContent[]): void {
+    this.citations.push(...citations)
+    this.content.push(...content)
+  }
+
+  hasData(): boolean {
+    return this.citations.length > 0
+  }
+
+  reset(): void {
+    this.citations = []
+    this.content = []
+  }
+}
+
+/**
+ * Configuration for prompt caching.
+ */
+export interface CacheConfig {
+  /**
+   * Caching strategy to use.
+   * - "auto": Automatically inject cache points at optimal positions based on model ID detection
+   *   (after tools, after last user message)
+   * - "anthropic": Force enable Anthropic-style caching (useful for application inference profiles)
+   */
+  strategy: 'auto' | 'anthropic'
+}
 
 /**
  * Base configuration interface for all model providers.
@@ -96,6 +133,12 @@ export interface StreamAggregatedResult {
    * Optional metadata about the model invocation, including usage statistics and metrics.
    */
   metadata?: ModelMetadataEvent
+
+  /**
+   * Optional redaction information when guardrails blocked input.
+   * Output redaction is handled by updating the message directly.
+   */
+  redaction?: Redaction
 }
 
 /**
@@ -160,8 +203,10 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
         return new ModelMessageStopEvent(event_data)
       case 'modelMetadataEvent':
         return new ModelMetadataEvent(event_data)
+      case 'modelRedactionEvent':
+        return new ModelRedactionEvent(event_data)
       default:
-        throw new Error(`Unsupported event type: ${event_data}`)
+        throw new Error(`Unsupported event type: ${(event_data as { type: string }).type}`)
     }
   }
 
@@ -210,10 +255,11 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
         signature?: string
         redactedContent?: Uint8Array
       } = {}
-      let errorToThrow: Error | undefined = undefined
+      const accumulatedCitations = new CitationAccumulator()
       let stoppedMessage: Message | null = null
       let finalStopReason: StopReason | null = null
       let metadata: ModelMetadataEvent | undefined = undefined
+      let redactionMessage: string | undefined = undefined
 
       for await (const event_data of this.stream(messages, options)) {
         const event = this._convert_to_class_event(event_data)
@@ -235,9 +281,10 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
             accumulatedToolInput = ''
             accumulatedText = ''
             accumulatedReasoning = {}
+            accumulatedCitations.reset()
             break
 
-          case 'modelContentBlockDeltaEvent':
+          case 'modelContentBlockDeltaEvent': {
             switch (event.delta.type) {
               case 'textDelta':
                 accumulatedText += event.delta.text
@@ -250,8 +297,12 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
                 if (event.delta.signature) accumulatedReasoning.signature = event.delta.signature
                 if (event.delta.redactedContent) accumulatedReasoning.redactedContent = event.delta.redactedContent
                 break
+              case 'citationsDelta':
+                accumulatedCitations.push(event.delta.citations, event.delta.content)
+                break
             }
             break
+          }
 
           case 'modelContentBlockStopEvent': {
             // Finalize and emit complete ContentBlock
@@ -272,6 +323,12 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
                   ...accumulatedReasoning,
                 })
                 accumulatedReasoning = {} // Reset after creating reasoning block
+              } else if (accumulatedCitations.hasData()) {
+                block = new CitationsBlock({
+                  citations: accumulatedCitations.citations,
+                  content: accumulatedCitations.content,
+                })
+                accumulatedCitations.reset()
               } else {
                 block = new TextBlock(accumulatedText)
               }
@@ -279,8 +336,8 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
               yield block
             } catch (e: unknown) {
               if (e instanceof SyntaxError) {
-                console.error('Unable to parse JSON string.')
-                errorToThrow = e
+                logger.error('unable to parse JSON string', e)
+                throw e
               }
             }
             break
@@ -302,6 +359,22 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
             metadata = event
             break
 
+          case 'modelRedactionEvent':
+            // Handle content redaction from guardrails
+            if (event.inputRedaction) {
+              // Store redaction message for agent to handle input message redaction
+              redactionMessage = event.inputRedaction.replaceContent
+            }
+            if (event.outputRedaction) {
+              // Update output message directly with redacted content
+              // Redaction event comes after modelMessageStopEvent, so we overwrite stoppedMessage
+              stoppedMessage = new Message({
+                role: 'assistant',
+                content: [new TextBlock(event.outputRedaction.replaceContent)],
+              })
+            }
+            break
+
           default:
             break
         }
@@ -309,23 +382,15 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
 
       if (!stoppedMessage || !finalStopReason) {
         // If we exit the loop without completing a message or stop reason, throw an error
-        throw new ModelError(
-          'Stream ended without completing a message',
-          errorToThrow ? { cause: errorToThrow } : undefined
-        )
+        throw new ModelError('Stream ended without completing a message')
       }
 
       // Handle stop reason
       if (finalStopReason === 'maxTokens') {
-        const maxTokensError = new MaxTokensError(
+        throw new MaxTokensError(
           'Model reached maximum token limit. This is an unrecoverable state that requires intervention.',
           stoppedMessage
         )
-        errorToThrow = maxTokensError
-      }
-
-      if (errorToThrow !== undefined) {
-        throw errorToThrow
       }
 
       // Return the final message with stop reason and optional metadata
@@ -335,6 +400,9 @@ export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
       }
       if (metadata !== undefined) {
         result.metadata = metadata
+      }
+      if (redactionMessage !== undefined) {
+        result.redaction = { userMessage: redactionMessage }
       }
       return result
     } catch (error) {

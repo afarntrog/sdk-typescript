@@ -2,11 +2,13 @@ import type { JSONValue, Serialized, MaybeSerializedInput, JSONSerializable } fr
 import { omitUndefined } from './json.js'
 import type { ImageBlockData, VideoBlockData, DocumentBlockData } from './media.js'
 import { ImageBlock, VideoBlock, DocumentBlock, encodeBase64, decodeBase64 } from './media.js'
+import type { CitationsBlockData } from './citations.js'
+import { CitationsBlock } from './citations.js'
 
 /**
  * Message types and content blocks for conversational AI interactions.
  *
- * This module follows a pattern where <name>Data interfaces define the structure
+ * This module follows a pattern where "Data" interfaces define the structure
  * for objects, while corresponding classes extend those interfaces with additional
  * functionality and type discrimination.
  */
@@ -115,6 +117,7 @@ export type ContentBlockData =
   | { image: ImageBlockData }
   | { video: VideoBlockData }
   | { document: DocumentBlockData }
+  | { citations: CitationsBlockData }
 
 export type ContentBlock =
   | TextBlock
@@ -126,6 +129,7 @@ export type ContentBlock =
   | ImageBlock
   | VideoBlock
   | DocumentBlock
+  | CitationsBlock
 
 /**
  * Data for a text block.
@@ -269,13 +273,18 @@ export class ToolUseBlock implements ToolUseBlockData, JSONSerializable<{ toolUs
 
 /**
  * Content within a tool result.
- * Can be either text or structured JSON data.
+ * Can be text, structured JSON data, or media blocks (image, video, document).
  *
  * This is a discriminated union where the object key determines the content format.
  */
-export type ToolResultContentData = TextBlockData | JsonBlockData
+export type ToolResultContentData =
+  | TextBlockData
+  | JsonBlockData
+  | { image: ImageBlockData }
+  | { video: VideoBlockData }
+  | { document: DocumentBlockData }
 
-export type ToolResultContent = TextBlock | JsonBlock
+export type ToolResultContent = TextBlock | JsonBlock | ImageBlock | VideoBlock | DocumentBlock
 
 /**
  * Data for a tool result block.
@@ -307,7 +316,7 @@ export interface ToolResultBlockData {
 /**
  * Tool result content block.
  */
-export class ToolResultBlock implements ToolResultBlockData, JSONSerializable<{ toolResult: ToolResultBlockData }> {
+export class ToolResultBlock implements JSONSerializable<{ toolResult: ToolResultBlockData }> {
   /**
    * Discriminator for tool result content.
    */
@@ -354,7 +363,7 @@ export class ToolResultBlock implements ToolResultBlockData, JSONSerializable<{ 
       toolResult: {
         toolUseId: this.toolUseId,
         status: this.status,
-        content: this.content.map((block) => block.toJSON()),
+        content: this.content.map((block) => block.toJSON() as ToolResultContentData),
       },
     }
   }
@@ -366,21 +375,29 @@ export class ToolResultBlock implements ToolResultBlockData, JSONSerializable<{ 
    * @returns ToolResultBlock instance
    */
   static fromJSON(data: { toolResult: ToolResultBlockData }): ToolResultBlock {
-    const content = data.toolResult.content.map((contentItem) => {
-      if ('text' in contentItem) {
-        return new TextBlock(contentItem.text)
-      } else if ('json' in contentItem) {
-        return new JsonBlock(contentItem)
-      } else {
-        throw new Error('Unknown ToolResultContentData type')
-      }
-    })
+    const content = data.toolResult.content.map(toolResultContentFromData)
     return new ToolResultBlock({
       toolUseId: data.toolResult.toolUseId,
       status: data.toolResult.status,
       content,
     })
   }
+}
+
+/**
+ * Converts a single ToolResultContentData to a ToolResultContent class instance.
+ *
+ * @param data - The tool result content data to convert
+ * @returns A ToolResultContent instance of the appropriate type
+ * @throws Error if the content data type is unknown
+ */
+export function toolResultContentFromData(data: ToolResultContentData): ToolResultContent {
+  if ('text' in data) return new TextBlock(data.text)
+  if ('json' in data) return new JsonBlock(data)
+  if ('image' in data) return ImageBlock.fromJSON(data as { image: ImageBlockData })
+  if ('video' in data) return VideoBlock.fromJSON(data as { video: VideoBlockData })
+  if ('document' in data) return DocumentBlock.fromJSON(data as { document: DocumentBlockData })
+  throw new Error('Unknown ToolResultContentData type')
 }
 
 /**
@@ -626,7 +643,7 @@ export type SystemPrompt = string | SystemContentBlock[]
  * Data representation of a system prompt.
  * Can be a simple string or an array of system content block data for advanced caching.
  *
- * This is the data interface counterpart to SystemPrompt, following the <name>Data pattern.
+ * This is the data interface counterpart to SystemPrompt, following the "Data" pattern.
  */
 export type SystemPromptData = string | SystemContentBlockData[]
 
@@ -850,19 +867,7 @@ export function contentBlockFromData(data: ContentBlockData): ContentBlock {
   } else if ('toolUse' in data) {
     return new ToolUseBlock(data.toolUse)
   } else if ('toolResult' in data) {
-    return new ToolResultBlock({
-      toolUseId: data.toolResult.toolUseId,
-      status: data.toolResult.status,
-      content: data.toolResult.content.map((contentItem) => {
-        if ('text' in contentItem) {
-          return new TextBlock(contentItem.text)
-        } else if ('json' in contentItem) {
-          return new JsonBlock(contentItem)
-        } else {
-          throw new Error('Unknown ToolResultContentData type')
-        }
-      }),
-    })
+    return ToolResultBlock.fromJSON(data)
   } else if ('reasoning' in data) {
     return ReasoningBlock.fromJSON(data)
   } else if ('cachePoint' in data) {
@@ -875,6 +880,8 @@ export function contentBlockFromData(data: ContentBlockData): ContentBlock {
     return VideoBlock.fromJSON(data)
   } else if ('document' in data) {
     return DocumentBlock.fromJSON(data)
+  } else if ('citations' in data) {
+    return CitationsBlock.fromJSON(data)
   } else {
     throw new Error('Unknown ContentBlockData type')
   }

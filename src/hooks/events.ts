@@ -1,4 +1,4 @@
-import type { AgentData, AgentResult } from '../types/agent.js'
+import type { LocalAgent, AgentResult } from '../types/agent.js'
 import type { ContentBlock, Message, StopReason, ToolResultBlock } from '../types/messages.js'
 import { type Tool, ToolStreamEvent } from '../tools/tool.js'
 import type { JSONValue } from '../types/json.js'
@@ -7,10 +7,10 @@ import type { ModelStreamEvent } from '../models/streaming.js'
 /**
  * Agent hook events.
  *
- * All events extend {@link StreamEvent} and carry `readonly agent: AgentData` with a
- * `readonly type` discriminator (camelCase of the class name) for switch-based narrowing.
- * Constructor takes a single data-object parameter. All properties are readonly except
- * explicit mutable flags (`retry`).
+ * All events extend {@link StreamEvent} with a `readonly type` discriminator
+ * (camelCase of the class name) for switch-based narrowing. Constructor takes
+ * a single data-object parameter. All properties are readonly except explicit
+ * mutable flags (`retry`).
  *
  * All current events extend {@link HookableEvent} (which itself extends {@link StreamEvent}),
  * making them both streamable and subscribable via hook callbacks. {@link StreamEvent} exists
@@ -45,13 +45,13 @@ import type { ModelStreamEvent } from '../models/streaming.js'
  *
  * ## Field naming conventions
  *
- * | Field          | Usage                                       |
- * |----------------|---------------------------------------------|
- * | `agent`        | Present on every event (`AgentData`)         |
- * | `.event`       | Inner event in update wrappers               |
- * | `.result`      | Finished result object                       |
- * | `.message`     | Message object                               |
- * | `.contentBlock`| Content block object                         |
+ * | Field           | Usage                                            |
+ * |-----------------|--------------------------------------------------|
+ * | `agent`         | `LocalAgent` reference on all agent-loop events  |
+ * | `.event`        | Inner event in update wrappers                   |
+ * | `.result`       | Finished result object                           |
+ * | `.message`      | Message object                                   |
+ * | `.contentBlock` | Content block object                             |
  */
 
 /**
@@ -83,11 +83,19 @@ export abstract class HookableEvent extends StreamEvent {
  */
 export class InitializedEvent extends HookableEvent {
   readonly type = 'initializedEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
 
-  constructor(data: { agent: AgentData }) {
+  constructor(data: { agent: LocalAgent }) {
     super()
     this.agent = data.agent
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<InitializedEvent, 'type'> {
+    return { type: this.type }
   }
 }
 
@@ -97,11 +105,19 @@ export class InitializedEvent extends HookableEvent {
  */
 export class BeforeInvocationEvent extends HookableEvent {
   readonly type = 'beforeInvocationEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
 
-  constructor(data: { agent: AgentData }) {
+  constructor(data: { agent: LocalAgent }) {
     super()
     this.agent = data.agent
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<BeforeInvocationEvent, 'type'> {
+    return { type: this.type }
   }
 }
 
@@ -112,15 +128,23 @@ export class BeforeInvocationEvent extends HookableEvent {
  */
 export class AfterInvocationEvent extends HookableEvent {
   readonly type = 'afterInvocationEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
 
-  constructor(data: { agent: AgentData }) {
+  constructor(data: { agent: LocalAgent }) {
     super()
     this.agent = data.agent
   }
 
   override _shouldReverseCallbacks(): boolean {
     return true
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<AfterInvocationEvent, 'type'> {
+    return { type: this.type }
   }
 }
 
@@ -131,23 +155,32 @@ export class AfterInvocationEvent extends HookableEvent {
  */
 export class MessageAddedEvent extends HookableEvent {
   readonly type = 'messageAddedEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly message: Message
 
-  constructor(data: { agent: AgentData; message: Message }) {
+  constructor(data: { agent: LocalAgent; message: Message }) {
     super()
     this.agent = data.agent
     this.message = data.message
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<MessageAddedEvent, 'type' | 'message'> {
+    return { type: this.type, message: this.message }
   }
 }
 
 /**
  * Event triggered just before a tool is executed.
  * Fired after tool lookup but before execution begins.
+ * Hook callbacks can set {@link cancel} to prevent the tool from executing.
  */
 export class BeforeToolCallEvent extends HookableEvent {
   readonly type = 'beforeToolCallEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly toolUse: {
     name: string
     toolUseId: string
@@ -155,8 +188,15 @@ export class BeforeToolCallEvent extends HookableEvent {
   }
   readonly tool: Tool | undefined
 
+  /**
+   * Set by hook callbacks to cancel this tool call.
+   * When set to `true`, a default cancel message is used.
+   * When set to a string, that string is used as the tool result error message.
+   */
+  cancel: boolean | string = false
+
   constructor(data: {
-    agent: AgentData
+    agent: LocalAgent
     toolUse: { name: string; toolUseId: string; input: JSONValue }
     tool: Tool | undefined
   }) {
@@ -164,6 +204,14 @@ export class BeforeToolCallEvent extends HookableEvent {
     this.agent = data.agent
     this.toolUse = data.toolUse
     this.tool = data.tool
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference, tool instance, and mutable cancel flag.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<BeforeToolCallEvent, 'type' | 'toolUse'> {
+    return { type: this.type, toolUse: this.toolUse }
   }
 }
 
@@ -174,7 +222,7 @@ export class BeforeToolCallEvent extends HookableEvent {
  */
 export class AfterToolCallEvent extends HookableEvent {
   readonly type = 'afterToolCallEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly toolUse: {
     name: string
     toolUseId: string
@@ -191,7 +239,7 @@ export class AfterToolCallEvent extends HookableEvent {
   retry?: boolean
 
   constructor(data: {
-    agent: AgentData
+    agent: LocalAgent
     toolUse: { name: string; toolUseId: string; input: JSONValue }
     tool: Tool | undefined
     result: ToolResultBlock
@@ -210,6 +258,20 @@ export class AfterToolCallEvent extends HookableEvent {
   override _shouldReverseCallbacks(): boolean {
     return true
   }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference, tool instance, and mutable retry flag.
+   * Converts Error to an extensible object for safe wire serialization.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<AfterToolCallEvent, 'type' | 'toolUse' | 'result'> & { error?: { message?: string } } {
+    return {
+      type: this.type,
+      toolUse: this.toolUse,
+      result: this.result,
+      ...(this.error !== undefined && { error: { message: this.error.message } }),
+    }
+  }
 }
 
 /**
@@ -218,12 +280,31 @@ export class AfterToolCallEvent extends HookableEvent {
  */
 export class BeforeModelCallEvent extends HookableEvent {
   readonly type = 'beforeModelCallEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
 
-  constructor(data: { agent: AgentData }) {
+  constructor(data: { agent: LocalAgent }) {
     super()
     this.agent = data.agent
   }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<BeforeModelCallEvent, 'type'> {
+    return { type: this.type }
+  }
+}
+
+/**
+ * Redaction information when guardrails block content.
+ */
+export interface Redaction {
+  /**
+   * The text to replace the user message with.
+   * When present, indicates the last user message should be redacted with this text.
+   */
+  userMessage: string
 }
 
 /**
@@ -238,6 +319,12 @@ export interface ModelStopData {
    * The reason the model stopped generating.
    */
   readonly stopReason: StopReason
+  /**
+   * Optional redaction info when guardrails blocked input.
+   * When present, indicates the last user message was redacted.
+   * The redacted message is available in `agent.messages` (last message).
+   */
+  readonly redaction?: Redaction
 }
 
 /**
@@ -249,7 +336,7 @@ export interface ModelStopData {
  */
 export class AfterModelCallEvent extends HookableEvent {
   readonly type = 'afterModelCallEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly stopData?: ModelStopData
   readonly error?: Error
 
@@ -259,7 +346,7 @@ export class AfterModelCallEvent extends HookableEvent {
    */
   retry?: boolean
 
-  constructor(data: { agent: AgentData; stopData?: ModelStopData; error?: Error }) {
+  constructor(data: { agent: LocalAgent; stopData?: ModelStopData; error?: Error }) {
     super()
     this.agent = data.agent
     if (data.stopData !== undefined) {
@@ -273,6 +360,19 @@ export class AfterModelCallEvent extends HookableEvent {
   override _shouldReverseCallbacks(): boolean {
     return true
   }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference and mutable retry flag.
+   * Converts Error to an extensible object for safe wire serialization.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<AfterModelCallEvent, 'type' | 'stopData'> & { error?: { message?: string } } {
+    return {
+      type: this.type,
+      ...(this.stopData !== undefined && { stopData: this.stopData }),
+      ...(this.error !== undefined && { error: { message: this.error.message } }),
+    }
+  }
 }
 
 /**
@@ -283,13 +383,21 @@ export class AfterModelCallEvent extends HookableEvent {
  */
 export class ModelStreamUpdateEvent extends HookableEvent {
   readonly type = 'modelStreamUpdateEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly event: ModelStreamEvent
 
-  constructor(data: { agent: AgentData; event: ModelStreamEvent }) {
+  constructor(data: { agent: LocalAgent; event: ModelStreamEvent }) {
     super()
     this.agent = data.agent
     this.event = data.event
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<ModelStreamUpdateEvent, 'type' | 'event'> {
+    return { type: this.type, event: this.event }
   }
 }
 
@@ -305,13 +413,21 @@ export class ModelStreamUpdateEvent extends HookableEvent {
  */
 export class ContentBlockEvent extends HookableEvent {
   readonly type = 'contentBlockEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly contentBlock: ContentBlock
 
-  constructor(data: { agent: AgentData; contentBlock: ContentBlock }) {
+  constructor(data: { agent: LocalAgent; contentBlock: ContentBlock }) {
     super()
     this.agent = data.agent
     this.contentBlock = data.contentBlock
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<ContentBlockEvent, 'type' | 'contentBlock'> {
+    return { type: this.type, contentBlock: this.contentBlock }
   }
 }
 
@@ -321,15 +437,23 @@ export class ContentBlockEvent extends HookableEvent {
  */
 export class ModelMessageEvent extends HookableEvent {
   readonly type = 'modelMessageEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly message: Message
   readonly stopReason: StopReason
 
-  constructor(data: { agent: AgentData; message: Message; stopReason: StopReason }) {
+  constructor(data: { agent: LocalAgent; message: Message; stopReason: StopReason }) {
     super()
     this.agent = data.agent
     this.message = data.message
     this.stopReason = data.stopReason
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<ModelMessageEvent, 'type' | 'message' | 'stopReason'> {
+    return { type: this.type, message: this.message, stopReason: this.stopReason }
   }
 }
 
@@ -339,13 +463,21 @@ export class ModelMessageEvent extends HookableEvent {
  */
 export class ToolResultEvent extends HookableEvent {
   readonly type = 'toolResultEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly result: ToolResultBlock
 
-  constructor(data: { agent: AgentData; result: ToolResultBlock }) {
+  constructor(data: { agent: LocalAgent; result: ToolResultBlock }) {
     super()
     this.agent = data.agent
     this.result = data.result
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<ToolResultEvent, 'type' | 'result'> {
+    return { type: this.type, result: this.result }
   }
 }
 
@@ -360,13 +492,21 @@ export class ToolResultEvent extends HookableEvent {
  */
 export class ToolStreamUpdateEvent extends HookableEvent {
   readonly type = 'toolStreamUpdateEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly event: ToolStreamEvent
 
-  constructor(data: { agent: AgentData; event: ToolStreamEvent }) {
+  constructor(data: { agent: LocalAgent; event: ToolStreamEvent }) {
     super()
     this.agent = data.agent
     this.event = data.event
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<ToolStreamUpdateEvent, 'type' | 'event'> {
+    return { type: this.type, event: this.event }
   }
 }
 
@@ -376,29 +516,53 @@ export class ToolStreamUpdateEvent extends HookableEvent {
  */
 export class AgentResultEvent extends HookableEvent {
   readonly type = 'agentResultEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly result: AgentResult
 
-  constructor(data: { agent: AgentData; result: AgentResult }) {
+  constructor(data: { agent: LocalAgent; result: AgentResult }) {
     super()
     this.agent = data.agent
     this.result = data.result
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<AgentResultEvent, 'type' | 'result'> {
+    return { type: this.type, result: this.result }
   }
 }
 
 /**
  * Event triggered before executing tools.
  * Fired when the model returns tool use blocks that need to be executed.
+ * Hook callbacks can set {@link cancel} to prevent all tools from executing.
  */
 export class BeforeToolsEvent extends HookableEvent {
   readonly type = 'beforeToolsEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly message: Message
 
-  constructor(data: { agent: AgentData; message: Message }) {
+  /**
+   * Set by hook callbacks to cancel all tool calls.
+   * When set to `true`, a default cancel message is used.
+   * When set to a string, that string is used as the tool result error message.
+   */
+  cancel: boolean | string = false
+
+  constructor(data: { agent: LocalAgent; message: Message }) {
     super()
     this.agent = data.agent
     this.message = data.message
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference and mutable cancel flag.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<BeforeToolsEvent, 'type' | 'message'> {
+    return { type: this.type, message: this.message }
   }
 }
 
@@ -409,10 +573,10 @@ export class BeforeToolsEvent extends HookableEvent {
  */
 export class AfterToolsEvent extends HookableEvent {
   readonly type = 'afterToolsEvent' as const
-  readonly agent: AgentData
+  readonly agent: LocalAgent
   readonly message: Message
 
-  constructor(data: { agent: AgentData; message: Message }) {
+  constructor(data: { agent: LocalAgent; message: Message }) {
     super()
     this.agent = data.agent
     this.message = data.message
@@ -420,5 +584,13 @@ export class AfterToolsEvent extends HookableEvent {
 
   override _shouldReverseCallbacks(): boolean {
     return true
+  }
+
+  /**
+   * Serializes for wire transport, excluding the agent reference.
+   * Called automatically by JSON.stringify().
+   */
+  toJSON(): Pick<AfterToolsEvent, 'type' | 'message'> {
+    return { type: this.type, message: this.message }
   }
 }

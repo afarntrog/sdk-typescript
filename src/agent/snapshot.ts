@@ -14,7 +14,8 @@
 import type { JSONValue } from '../types/json.js'
 import type { MessageData, SystemPromptData } from '../types/messages.js'
 import { Message, systemPromptFromData, systemPromptToData } from '../types/messages.js'
-import type { Agent } from './agent.js'
+import { loadStateSerializable, serializeStateSerializable } from '../types/serializable.js'
+import type { LocalAgent } from '../types/agent.js'
 
 /**
  * Current schema version of the snapshot format.
@@ -124,7 +125,7 @@ export type TakeSnapshotOptions = {
  * @param options - Snapshot options
  * @returns A snapshot of the agent's state
  */
-export function takeSnapshot(agent: Agent, options: TakeSnapshotOptions): Snapshot {
+export function takeSnapshot(agent: LocalAgent, options: TakeSnapshotOptions): Snapshot {
   const fields = resolveSnapshotFields(options)
 
   const data: Record<string, JSONValue> = {}
@@ -134,7 +135,7 @@ export function takeSnapshot(agent: Agent, options: TakeSnapshotOptions): Snapsh
   }
 
   if (fields.has('state')) {
-    data.state = agent.state.toJSON()
+    data.state = serializeStateSerializable(agent.appState)
   }
 
   if (fields.has('systemPrompt')) {
@@ -159,29 +160,34 @@ export function takeSnapshot(agent: Agent, options: TakeSnapshotOptions): Snapsh
  * @param agent - The agent to restore state into
  * @param snapshot - The snapshot to load
  */
-export function loadSnapshot(agent: Agent, snapshot: Snapshot): void {
+export function loadSnapshot(agent: LocalAgent, snapshot: Snapshot): void {
   if (snapshot.schemaVersion !== SNAPSHOT_SCHEMA_VERSION) {
     throw new Error(
       `Unsupported snapshot schema version: ${snapshot.schemaVersion}. Current version: ${SNAPSHOT_SCHEMA_VERSION}`
     )
   }
 
-  const { messages, state, systemPrompt } = snapshot.data
-
-  if (messages !== undefined) {
+  if ('messages' in snapshot.data) {
+    const messages = snapshot.data.messages
     agent.messages.length = 0
     for (const msgData of messages as unknown as MessageData[]) {
       agent.messages.push(Message.fromJSON(msgData))
     }
   }
 
-  if (state !== undefined) {
-    agent.state.loadStateFromJson(state)
+  if ('state' in snapshot.data) {
+    loadStateSerializable(agent.appState, snapshot.data.state)
   }
 
-  // Only restore systemPrompt if explicitly present and non-null in the snapshot
-  if (systemPrompt !== undefined && systemPrompt !== null) {
-    agent.systemPrompt = systemPromptFromData(systemPrompt as SystemPromptData)
+  // Use key-presence check to distinguish "field absent" (leave unchanged) from
+  // "field present as null" (agent had no system prompt — clear it).
+  if ('systemPrompt' in snapshot.data) {
+    const systemPrompt = snapshot.data.systemPrompt
+    if (systemPrompt !== null) {
+      agent.systemPrompt = systemPromptFromData(systemPrompt as SystemPromptData)
+    } else {
+      delete agent.systemPrompt
+    }
   }
 }
 

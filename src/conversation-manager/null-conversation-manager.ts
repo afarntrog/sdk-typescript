@@ -6,21 +6,26 @@
  * management is handled externally.
  */
 
-import type { HookProvider } from '../hooks/types.js'
-import type { HookRegistry } from '../hooks/registry.js'
+import { ConversationManager, type ConversationManagerReduceOptions } from './conversation-manager.js'
 
 /**
  * A no-op conversation manager that does not modify the conversation history.
- * Implements HookProvider but registers zero hooks.
+ *
+ * Does not register any proactive hooks. Overflow errors will not be retried
+ * since `reduce` always returns `false`.
  */
-export class NullConversationManager implements HookProvider {
+export class NullConversationManager extends ConversationManager {
   /**
-   * Registers callbacks with the hook registry.
-   * This implementation registers no hooks, providing a complete no-op behavior.
-   *
-   * @param _registry - The hook registry to register callbacks with (unused)
+   * Unique identifier for this conversation manager.
    */
-  public registerCallbacks(_registry: HookRegistry): void {
-    // No-op - register zero hooks
+  readonly name = 'strands:null-conversation-manager'
+
+  /**
+   * No-op reduction — never modifies the conversation history.
+   *
+   * @returns `false` always
+   */
+  reduce(_args: ConversationManagerReduceOptions): boolean {
+    return false
   }
 }

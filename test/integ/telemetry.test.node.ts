@@ -1,12 +1,20 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest'
 import { Agent, tool } from '@strands-agents/sdk'
+import { getTracer, getMeter } from '@strands-agents/sdk/telemetry'
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
-import { SpanStatusCode } from '@opentelemetry/api'
+import { SpanStatusCode, trace, context, metrics as otelMetrics } from '@opentelemetry/api'
+import {
+  MeterProvider,
+  InMemoryMetricExporter,
+  PeriodicExportingMetricReader,
+  AggregationTemporality,
+} from '@opentelemetry/sdk-metrics'
 import { z } from 'zod'
 import { MockMessageModel } from '$/sdk/__fixtures__/mock-message-model.js'
 import { TestModelProvider, collectGenerator } from '$/sdk/__fixtures__/model-test-helpers.js'
+import { findMetricValue } from '$/sdk/__fixtures__/metrics-helpers.js'
 
 const AGENT_SPAN_PREFIX = 'invoke_agent'
 const CYCLE_SPAN_NAME = 'execute_agent_loop_cycle'
@@ -698,5 +706,240 @@ describe.sequential('Telemetry Integration', () => {
       // Both responses were seen
       expect(expectedResponses.size).toBe(0)
     })
+  })
+
+  describe('getTracer', () => {
+    it('returns a tracer that produces spans captured by the registered provider', async () => {
+      const tracer = getTracer()
+      const span = tracer.startSpan('custom-operation')
+      span.setAttribute('custom.key', 'custom-value')
+      span.end()
+
+      const spans = await flush()
+      const customSpans = spans.filter((s) => s.name === 'custom-operation')
+
+      expect(customSpans).toHaveLength(1)
+      expect(attr(customSpans[0]!, 'custom.key')).toBe('custom-value')
+    })
+
+    // The OTel global tracer provider can only be set once per process via register().
+    // Subsequent register() calls are no-ops and emit a warning. All spans always
+    // land in the first registered provider.
+
+    it('ignores later register() calls — spans stay in the first registered provider', async () => {
+      const userExporter = new InMemorySpanExporter()
+      const userProvider = new NodeTracerProvider()
+      userProvider.addSpanProcessor(new SimpleSpanProcessor(userExporter))
+      userProvider.register() // no-op: global provider already set in beforeAll
+
+      const tracer = getTracer()
+      const span = tracer.startSpan('user-provider-span')
+      span.setAttribute('source', 'custom-provider')
+      span.end()
+
+      // Span lands in the original shared provider, not the user's
+      const spans = await flush()
+      const sharedSpan = spans.find((s) => s.name === 'user-provider-span')
+      expect(sharedSpan).toBeDefined()
+      expect(sharedSpan!.attributes['source']).toBe('custom-provider')
+
+      // The user's exporter never receives the span
+      await userProvider.forceFlush()
+      const userSpans = userExporter.getFinishedSpans()
+      expect(userSpans.find((s) => s.name === 'user-provider-span')).toBeUndefined()
+    })
+
+    it('all spans land in the first registered provider even when multiple providers call register()', async () => {
+      const exporterA = new InMemorySpanExporter()
+      const providerA = new NodeTracerProvider()
+      providerA.addSpanProcessor(new SimpleSpanProcessor(exporterA))
+      providerA.register() // no-op
+
+      const exporterB = new InMemorySpanExporter()
+      const providerB = new NodeTracerProvider()
+      providerB.addSpanProcessor(new SimpleSpanProcessor(exporterB))
+      providerB.register() // no-op
+
+      const tracer = getTracer()
+      const span = tracer.startSpan('multi-register-span')
+      span.end()
+
+      // Span lands in the original shared provider
+      const spans = await flush()
+      expect(spans.find((s) => s.name === 'multi-register-span')).toBeDefined()
+
+      // Neither late provider receives the span
+      await providerA.forceFlush()
+      await providerB.forceFlush()
+      expect(exporterA.getFinishedSpans().find((s) => s.name === 'multi-register-span')).toBeUndefined()
+      expect(exporterB.getFinishedSpans().find((s) => s.name === 'multi-register-span')).toBeUndefined()
+    })
+
+    it('creates custom spans that nest under agent spans via context propagation', async () => {
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hi' })
+      const agent = new Agent({ model, printer: false, name: 'gettracer-nest-agent' })
+
+      await agent.invoke('Hello')
+
+      const allSpans = await flush()
+      const agentReadableSpan = findSpans(allSpans, AGENT_SPAN_PREFIX)[0]!
+
+      // Wrap the ReadableSpan's context into a live span reference for context propagation
+      const agentSpanRef = trace.wrapSpanContext(agentReadableSpan.spanContext())
+
+      // Create a custom span parented to the agent span via context
+      const tracer = getTracer()
+      context.with(trace.setSpan(context.active(), agentSpanRef), () => {
+        const childSpan = tracer.startSpan('custom-child')
+        childSpan.end()
+      })
+
+      const spansAfter = await flush()
+      const childSpan = spansAfter.find((s) => s.name === 'custom-child')!
+
+      expect(childSpan).toBeDefined()
+      expect(childSpan.spanContext().traceId).toBe(agentReadableSpan.spanContext().traceId)
+      expect(childSpan.parentSpanId).toBe(agentReadableSpan.spanContext().spanId)
+    })
+  })
+})
+
+describe.sequential('Metrics Integration', () => {
+  let metricExporter: InMemoryMetricExporter
+  let metricReader: PeriodicExportingMetricReader
+  let meterProvider: MeterProvider
+
+  const calculatorTool = tool({
+    name: 'calculator',
+    description: 'Add two numbers',
+    inputSchema: z.object({ a: z.number(), b: z.number() }),
+    callback: ({ a, b }) => `${a + b}`,
+  })
+
+  beforeAll(() => {
+    metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE)
+    metricReader = new PeriodicExportingMetricReader({
+      exporter: metricExporter,
+      exportIntervalMillis: 100,
+    })
+    meterProvider = new MeterProvider({
+      readers: [metricReader],
+    })
+    otelMetrics.setGlobalMeterProvider(meterProvider)
+  })
+
+  beforeEach(() => {
+    metricExporter.reset()
+  })
+
+  afterAll(async () => {
+    await meterProvider.forceFlush()
+    await meterProvider.shutdown()
+  })
+
+  async function collectMetrics(): Promise<ReturnType<typeof metricExporter.getMetrics>> {
+    await meterProvider.forceFlush()
+    return [...metricExporter.getMetrics()]
+  }
+
+  it('emits cycle count metrics during agent invocation', async () => {
+    const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })
+    const agent = new Agent({ model, printer: false, name: 'metrics-cycle-agent' })
+
+    await agent.invoke('Hi')
+
+    const metrics = await collectMetrics()
+    const cycleCount = findMetricValue(metrics, 'gen_ai.agent.cycle.count')
+
+    expect(cycleCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it('emits invocation count metrics', async () => {
+    const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })
+    const agent = new Agent({ model, printer: false, name: 'metrics-invocation-agent' })
+
+    await agent.invoke('Hi')
+
+    const metrics = await collectMetrics()
+    const invocationCount = findMetricValue(metrics, 'gen_ai.agent.invocation.count')
+
+    expect(invocationCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it('emits token usage metrics', async () => {
+    const model = new MockMessageModel().addTurn(
+      { type: 'textBlock', text: 'Hello back' },
+      { usage: { inputTokens: 50, outputTokens: 25, totalTokens: 75 } }
+    )
+
+    const agent = new Agent({ model, printer: false, name: 'metrics-token-agent' })
+
+    await agent.invoke('Hello')
+
+    const metrics = await collectMetrics()
+    const inputTokens = findMetricValue(metrics, 'gen_ai.agent.tokens.input')
+    const outputTokens = findMetricValue(metrics, 'gen_ai.agent.tokens.output')
+
+    expect(inputTokens).toBeGreaterThanOrEqual(50)
+    expect(outputTokens).toBeGreaterThanOrEqual(25)
+  })
+
+  it('emits tool call metrics when tools are used', async () => {
+    const model = new MockMessageModel()
+      .addTurn(
+        { type: 'toolUseBlock', name: 'calculator', toolUseId: 'tool-1', input: { a: 1, b: 2 } },
+        { usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 } }
+      )
+      .addTurn(
+        { type: 'textBlock', text: 'The answer is 3' },
+        { usage: { inputTokens: 40, outputTokens: 15, totalTokens: 55 } }
+      )
+
+    const agent = new Agent({ model, printer: false, name: 'metrics-tool-agent', tools: [calculatorTool] })
+
+    await agent.invoke('Add 1 and 2')
+
+    const metrics = await collectMetrics()
+    const toolCallCount = findMetricValue(metrics, 'gen_ai.agent.tool.call.count')
+
+    expect(toolCallCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it('emits cycle duration histogram', async () => {
+    const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Done' })
+    const agent = new Agent({ model, printer: false, name: 'metrics-duration-agent' })
+
+    await agent.invoke('Hello')
+
+    const metrics = await collectMetrics()
+    const durationValue = findMetricValue(metrics, 'gen_ai.agent.cycle.duration')
+
+    expect(durationValue).toBeDefined()
+  })
+
+  it('emits metrics across multiple invocations cumulatively', async () => {
+    const model1 = new MockMessageModel().addTurn({ type: 'textBlock', text: 'First' })
+    const model2 = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Second' })
+
+    const agent1 = new Agent({ model: model1, printer: false, name: 'metrics-multi-1' })
+    const agent2 = new Agent({ model: model2, printer: false, name: 'metrics-multi-2' })
+
+    await agent1.invoke('Hello')
+    await agent2.invoke('World')
+
+    const metrics = await collectMetrics()
+    const cycleCount = findMetricValue(metrics, 'gen_ai.agent.cycle.count')
+
+    // At least 2 cycles (one per invocation)
+    expect(cycleCount).toBeGreaterThanOrEqual(2)
+  })
+
+  it('getMeter returns a meter that records real metrics', async () => {
+    const meter = getMeter()
+    const counter = meter.createCounter('test.custom.counter')
+    counter.add(7)
+
+    const metrics = await collectMetrics()
+    expect(findMetricValue(metrics, 'test.custom.counter')).toBe(7)
   })
 })

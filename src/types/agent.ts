@@ -1,5 +1,6 @@
-import type { AppState } from '../app-state.js'
-import type { Message, StopReason } from './messages.js'
+import type { StateStore } from '../state-store.js'
+import type { ContentBlock, ContentBlockData, Message, MessageData, StopReason, SystemPrompt } from './messages.js'
+import type { AgentTrace } from '../telemetry/tracer.js'
 import type {
   BeforeInvocationEvent,
   AfterInvocationEvent,
@@ -16,23 +17,113 @@ import type {
   ToolResultEvent,
   ToolStreamUpdateEvent,
   AgentResultEvent,
+  HookableEvent,
+  StreamEvent,
 } from '../hooks/events.js'
+import type { HookCallback, HookableEventConstructor, HookCleanup } from '../hooks/types.js'
+import type { ToolRegistry } from '../registry/tool-registry.js'
 import type { z } from 'zod'
+import { AgentMetrics } from '../telemetry/meter.js'
 
 /**
- * Interface for objects that provide agent state.
- * Allows ToolContext to work with different agent types.
+ * Arguments for invoking an agent.
+ *
+ * Supports multiple input formats:
+ * - `string` - User text input (wrapped in TextBlock, creates user Message)
+ * - `ContentBlock[]` | `ContentBlockData[]` - Array of content blocks (creates single user Message)
+ * - `Message[]` | `MessageData[]` - Array of messages (appends all to conversation)
  */
-export interface AgentData {
+export type InvokeArgs = string | ContentBlock[] | ContentBlockData[] | Message[] | MessageData[]
+
+/**
+ * Options for a single agent invocation.
+ */
+export interface InvokeOptions {
+  /**
+   * Zod schema for structured output validation, overriding the constructor-provided schema for this invocation only.
+   */
+  structuredOutputSchema?: z.ZodSchema
+}
+
+/**
+ * Interface for agents that support request-response invocation.
+ *
+ * Both `Agent` (full orchestration agent) and `A2AAgent` (remote agent proxy)
+ * implement this interface, enabling polymorphic usage across the SDK.
+ */
+export interface InvokableAgent {
+  /**
+   * The unique identifier of the agent instance.
+   */
+  readonly id: string
+
+  /**
+   * The name of the agent.
+   */
+  readonly name?: string
+
+  /**
+   * Optional description of what the agent does.
+   */
+  readonly description?: string
+
+  /**
+   * Invokes the agent and returns the final result.
+   *
+   * @param args - Arguments for invoking the agent
+   * @param options - Optional invocation options (e.g. structured output schema)
+   * @returns Promise that resolves to the final AgentResult
+   */
+  invoke(args: InvokeArgs, options?: InvokeOptions): Promise<AgentResult>
+
+  /**
+   * Streams the agent execution, yielding events and returning the final result.
+   *
+   * @param args - Arguments for invoking the agent
+   * @param options - Optional invocation options (e.g. structured output schema)
+   * @returns Async generator that yields stream events and returns AgentResult
+   */
+  stream(args: InvokeArgs, options?: InvokeOptions): AsyncGenerator<StreamEvent, AgentResult, undefined>
+}
+
+/**
+ * Interface for agents with locally accessible state, messages, tools, and hooks.
+ * Used by ToolContext and hook events that need access to agent internals.
+ */
+export interface LocalAgent {
+  /**
+   * The unique identifier of the agent instance.
+   */
+  readonly id: string
+
   /**
    * App state storage accessible to tools and application logic.
    */
-  state: AppState
+  appState: StateStore
 
   /**
    * The conversation history of messages between user and assistant.
    */
   messages: Message[]
+
+  /**
+   * The tool registry for registering tools with the agent.
+   */
+  readonly toolRegistry: ToolRegistry
+
+  /**
+   * The system prompt to pass to the model provider.
+   */
+  systemPrompt?: SystemPrompt
+
+  /**
+   * Register a hook callback for a specific event type.
+   *
+   * @param eventType - The event class constructor to register the callback for
+   * @param callback - The callback function to invoke when the event occurs
+   * @returns Cleanup function that removes the callback when invoked
+   */
+  addHook<T extends HookableEvent>(eventType: HookableEventConstructor<T>, callback: HookCallback<T>): HookCleanup
 }
 
 /**
@@ -52,16 +143,59 @@ export class AgentResult {
   readonly lastMessage: Message
 
   /**
+   * Local execution traces collected during the agent invocation.
+   * Contains timing and hierarchy of operations within the agent loop.
+   */
+  readonly traces?: AgentTrace[]
+
+  /**
    * The validated structured output from the LLM, if a schema was provided.
    * Type represents any validated Zod schema output.
    */
   readonly structuredOutput?: z.output<z.ZodType>
 
-  constructor(data: { stopReason: StopReason; lastMessage: Message; structuredOutput?: z.output<z.ZodType> }) {
+  /**
+   * Aggregated metrics for the agent's loop execution.
+   * Tracks cycle counts, token usage, tool execution stats, and model latency.
+   */
+  readonly metrics?: AgentMetrics
+
+  constructor(data: {
+    stopReason: StopReason
+    lastMessage: Message
+    traces?: AgentTrace[]
+    metrics?: AgentMetrics
+    structuredOutput?: z.output<z.ZodType>
+  }) {
     this.stopReason = data.stopReason
     this.lastMessage = data.lastMessage
+    if (data.traces !== undefined) {
+      this.traces = data.traces
+    }
+    if (data.metrics !== undefined) {
+      this.metrics = data.metrics
+    }
     if (data.structuredOutput !== undefined) {
       this.structuredOutput = data.structuredOutput
+    }
+  }
+
+  /**
+   * Custom JSON serialization that excludes traces and metrics by default.
+   * This prevents accidentally sending large trace/metric data over the wire
+   * when serializing AgentResult for API responses.
+   *
+   * Traces and metrics remain accessible via their properties for debugging,
+   * but won't be included in JSON.stringify() output.
+   *
+   * @returns Object representation without traces/metrics for safe serialization
+   */
+  public toJSON(): object {
+    return {
+      type: this.type,
+      stopReason: this.stopReason,
+      lastMessage: this.lastMessage,
+      ...(this.structuredOutput !== undefined && { structuredOutput: this.structuredOutput }),
     }
   }
 
